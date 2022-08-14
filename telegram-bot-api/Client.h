@@ -104,6 +104,7 @@ class Client final : public WebhookActor::Callback {
   class JsonAnimation;
   class JsonAudio;
   class JsonDocument;
+  class JsonFileDownloadStatus;
   class JsonPhotoSize;
   class JsonPhoto;
   class JsonChatPhoto;
@@ -560,6 +561,8 @@ class Client final : public WebhookActor::Callback {
   Status process_set_webhook_query(PromisedQueryPtr &query);
   Status process_get_webhook_info_query(PromisedQueryPtr &query);
   Status process_get_file_query(PromisedQueryPtr &query);
+  Status process_status_get_file_query(PromisedQueryPtr &query);
+  Status process_cancel_get_file_query(PromisedQueryPtr &query);
 
   void webhook_verified(td::string cached_ip_address) final;
   void webhook_success() final;
@@ -582,6 +585,9 @@ class Client final : public WebhookActor::Callback {
   void on_sent_message(object_ptr<td_api::message> &&message, int64 query_id);
 
   void do_get_file(object_ptr<td_api::file> file, PromisedQueryPtr query);
+  void do_cancel_get_file(object_ptr<td_api::file> file, PromisedQueryPtr query);
+
+  void do_get_file_download_status(td::Result<object_ptr<td_api::file>> r_file, PromisedQueryPtr query);
 
   bool is_file_being_downloaded(int32 file_id) const;
   void on_file_download(int32 file_id, td::Result<object_ptr<td_api::file>> r_file);

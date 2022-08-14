@@ -284,6 +284,8 @@ bool Client::init_methods() {
   methods_.emplace("deletewebhook", &Client::process_set_webhook_query);
   methods_.emplace("getwebhookinfo", &Client::process_get_webhook_info_query);
   methods_.emplace("getfile", &Client::process_get_file_query);
+  methods_.emplace("statusgetfile", &Client::process_status_get_file_query);
+  methods_.emplace("cancelgetfile", &Client::process_cancel_get_file_query);
   return true;
 }
 
@@ -301,6 +303,24 @@ class Client::JsonFile final : public Jsonable {
   const td_api::file *file_;
   const Client *client_;
   bool with_path_;
+};
+
+class Client::JsonFileDownloadStatus final : public Jsonable {
+ public:
+  JsonFileDownloadStatus(const td_api::file *file) : file_(file) {
+  }
+  void store(JsonValueScope *scope) const {
+    auto object = scope->enter_object();
+    object("file_id", file_->remote_->id_);
+    object("file_unique_id", file_->remote_->unique_id_);
+    object("is_downloading_active", td::JsonBool(file_->local_->is_downloading_active_));
+    object("is_downloading_completed", td::JsonBool(file_->local_->is_downloading_completed_));
+    object("downloaded_size", file_->local_->downloaded_size_);
+
+  }
+
+ private:
+  const td_api::file *file_;
 };
 
 class Client::JsonDatedFile final : public Jsonable {
@@ -8592,6 +8612,23 @@ td::Status Client::process_get_file_query(PromisedQueryPtr &query) {
   return Status::OK();
 }
 
+td::Status Client::process_status_get_file_query(PromisedQueryPtr &query) {
+  td::string file_id = query->arg("file_id").str();
+  check_remote_file_id(file_id, std::move(query), [this](object_ptr<td_api::file> file, PromisedQueryPtr query) {
+    LOG(INFO) << "File download info: " << " " << to_string(file);
+    do_get_file_download_status(std::move(file), std::move(query));
+  });
+  return Status::OK();
+}
+
+td::Status Client::process_cancel_get_file_query(PromisedQueryPtr &query) {
+  td::string file_id = query->arg("file_id").str();
+  check_remote_file_id(file_id, std::move(query), [this](object_ptr<td_api::file> file, PromisedQueryPtr query) {
+    do_cancel_get_file(std::move(file), std::move(query));
+  });
+  return Status::OK();
+}
+
 void Client::do_get_file(object_ptr<td_api::file> file, PromisedQueryPtr query) {
   if (!parameters_->local_mode_ &&
       td::max(file->expected_size_, file->local_->downloaded_size_) > MAX_DOWNLOAD_FILE_SIZE) {  // speculative check
@@ -8600,9 +8637,44 @@ void Client::do_get_file(object_ptr<td_api::file> file, PromisedQueryPtr query) 
 
   auto file_id = file->id_;
   file_download_listeners_[file_id].push_back(std::move(query));
+  if (file->local_->is_downloading_completed_) {
+    Slice relative_path = td::PathView::relative(file->local_->path_, dir_, true);
+    if (!relative_path.empty()) {
+      auto r_stat = td::stat(file->local_->path_);
+      if (r_stat.is_ok() && r_stat.ok().is_reg_ && r_stat.ok().size_ == file->size_) {
+        return on_file_download(file_id, std::move(file));
+      }
+    }
+  }
+
   send_request(make_object<td_api::downloadFile>(file_id, 1, 0, 0, false),
                td::make_unique<TdOnDownloadFileCallback>(this, file_id));
 }
+
+void Client::do_get_file_download_status(td::Result<object_ptr<td_api::file>> r_file, PromisedQueryPtr query) {
+  if (r_file.is_error()) {
+    const auto &error = r_file.error();
+    fail_query_with_error(std::move(query), error.code(), error.public_message());
+  } else {
+    answer_query(JsonFileDownloadStatus(r_file.ok().get()), std::move(query));
+  }
+}
+
+void Client::do_cancel_get_file(object_ptr<td_api::file> file, PromisedQueryPtr query) {
+
+  if (file->local_->is_downloading_active_) {
+    send_request(make_object<td_api::cancelDownloadFile>(file->id_, false),
+                 td::make_unique<TdOnCancelDownloadFileCallback>());
+    answer_query(td::JsonTrue(), std::move(query),Slice("Download canceled"));
+  } else if(file->local_->is_downloading_completed_){
+    answer_query(td::JsonTrue(), std::move(query),Slice("Download already completed"));
+  } else if(!file->local_->is_downloading_completed_ && file->local_->downloaded_size_ > 0){
+    answer_query(td::JsonTrue(), std::move(query),Slice("Download already canceled"));
+  } else {
+    answer_query(td::JsonTrue(), std::move(query),Slice("File never downloaded"));
+  }
+}
+
 
 bool Client::is_file_being_downloaded(int32 file_id) const {
   return file_download_listeners_.count(file_id) > 0;
