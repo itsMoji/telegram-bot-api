@@ -42,15 +42,23 @@ using td::JsonValue;
 using td_api::make_object;
 using td_api::move_object_as;
 
+int Client::get_retry_after_time(Slice error_message) {
+  Slice prefix = "Too Many Requests: retry after ";
+  if (begins_with(error_message, prefix)) {
+    auto r_retry_after = td::to_integer_safe<int>(error_message.substr(prefix.size()));
+    if (r_retry_after.is_ok() && r_retry_after.ok() > 0) {
+      return r_retry_after.ok();
+    }
+  }
+  return 0;
+}
+
 void Client::fail_query_with_error(PromisedQueryPtr query, int32 error_code, Slice error_message,
                                    Slice default_message) {
   if (error_code == 429) {
-    Slice prefix = "Too Many Requests: retry after ";
-    if (begins_with(error_message, prefix)) {
-      auto r_retry_after = td::to_integer_safe<int>(error_message.substr(prefix.size()));
-      if (r_retry_after.is_ok() && r_retry_after.ok() > 0) {
-        return query->set_retry_after_error(r_retry_after.ok());
-      }
+    auto retry_after_time = get_retry_after_time(error_message);
+    if (retry_after_time > 0) {
+      return query->set_retry_after_error(retry_after_time);
     }
     LOG(ERROR) << "Wrong error message: " << error_message << " from " << *query;
     return fail_query(500, error_message, std::move(query));
@@ -187,9 +195,9 @@ Client::Client(td::ActorShared<> parent, const td::string &bot_token, bool is_te
 }
 
 Client::~Client() {
-  td::Scheduler::instance()->destroy_on_scheduler(get_file_gc_scheduler_id(), messages_, users_, groups_, supergroups_,
-                                                  chats_, reply_message_ids_, yet_unsent_reply_message_ids_,
-                                                  sticker_set_names_);
+  td::Scheduler::instance()->destroy_on_scheduler(SharedData::get_file_gc_scheduler_id(), messages_, users_, groups_,
+                                                  supergroups_, chats_, reply_message_ids_,
+                                                  yet_unsent_reply_message_ids_, sticker_set_names_);
 }
 
 bool Client::init_methods() {
@@ -253,6 +261,13 @@ bool Client::init_methods() {
   methods_.emplace("unpinallchatmessages", &Client::process_unpin_all_chat_messages_query);
   methods_.emplace("setchatstickerset", &Client::process_set_chat_sticker_set_query);
   methods_.emplace("deletechatstickerset", &Client::process_delete_chat_sticker_set_query);
+  methods_.emplace("getforumtopiciconstickers", &Client::process_get_forum_topic_icon_stickers_query);
+  methods_.emplace("createforumtopic", &Client::process_create_forum_topic_query);
+  methods_.emplace("editforumtopic", &Client::process_edit_forum_topic_query);
+  methods_.emplace("closeforumtopic", &Client::process_close_forum_topic_query);
+  methods_.emplace("reopenforumtopic", &Client::process_reopen_forum_topic_query);
+  methods_.emplace("deleteforumtopic", &Client::process_delete_forum_topic_query);
+  methods_.emplace("unpinallforumtopicmessages", &Client::process_unpin_all_forum_topic_messages_query);
   methods_.emplace("getchatmember", &Client::process_get_chat_member_query);
   methods_.emplace("getchatadministrators", &Client::process_get_chat_administrators_query);
   methods_.emplace("getchatmembercount", &Client::process_get_chat_member_count_query);
@@ -287,6 +302,11 @@ bool Client::init_methods() {
   methods_.emplace("statusgetfile", &Client::process_status_get_file_query);
   methods_.emplace("cancelgetfile", &Client::process_cancel_get_file_query);
   return true;
+}
+
+bool Client::is_local_method(Slice method) {
+  return method == "close" || method == "logout" || method == "getme" || method == "getupdates" ||
+         method == "setwebhook" || method == "deletewebhook" || method == "getwebhookinfo";
 }
 
 class Client::JsonFile final : public Jsonable {
@@ -370,8 +390,8 @@ class Client::JsonUser final : public Jsonable {
     if (user_info != nullptr && !user_info->last_name.empty()) {
       object("last_name", user_info->last_name);
     }
-    if (user_info != nullptr && !user_info->username.empty()) {
-      object("username", user_info->username);
+    if (user_info != nullptr && !user_info->active_usernames.empty()) {
+      object("username", user_info->active_usernames[0]);
     }
     if (user_info != nullptr && !user_info->language_code.empty()) {
       object("language_code", user_info->language_code);
@@ -674,11 +694,18 @@ class Client::JsonChat final : public Jsonable {
         if (!user_info->last_name.empty()) {
           object("last_name", user_info->last_name);
         }
-        if (!user_info->username.empty()) {
-          object("username", user_info->username);
+        if (!user_info->active_usernames.empty()) {
+          object("username", user_info->active_usernames[0]);
         }
         object("type", "private");
         if (is_full_) {
+          if (!user_info->active_usernames.empty()) {
+            object("active_usernames", td::json_array(user_info->active_usernames,
+                                                      [](Slice username) { return td::JsonString(username); }));
+          }
+          if (user_info->emoji_status_custom_emoji_id != 0) {
+            object("emoji_status_custom_emoji_id", td::to_string(user_info->emoji_status_custom_emoji_id));
+          }
           if (!user_info->bio.empty()) {
             object("bio", user_info->bio);
           }
@@ -722,8 +749,11 @@ class Client::JsonChat final : public Jsonable {
 
         auto supergroup_info = client_->get_supergroup_info(chat_info->supergroup_id);
         CHECK(supergroup_info != nullptr);
-        if (!supergroup_info->username.empty()) {
-          object("username", supergroup_info->username);
+        if (!supergroup_info->active_usernames.empty()) {
+          object("username", supergroup_info->active_usernames[0]);
+        }
+        if (supergroup_info->is_supergroup && supergroup_info->is_forum) {
+          object("is_forum", td::JsonTrue());
         }
 
         if (supergroup_info->is_supergroup) {
@@ -732,6 +762,10 @@ class Client::JsonChat final : public Jsonable {
           object("type", "channel");
         }
         if (is_full_) {
+          if (!supergroup_info->active_usernames.empty()) {
+            object("active_usernames", td::json_array(supergroup_info->active_usernames,
+                                                      [](Slice username) { return td::JsonString(username); }));
+          }
           if (!supergroup_info->description.empty()) {
             object("description", supergroup_info->description);
           }
@@ -807,7 +841,7 @@ class Client::JsonChat final : public Jsonable {
       }
       if (pinned_message_id_ != 0) {
         CHECK(pinned_message_id_ != -1);
-        const MessageInfo *pinned_message = client_->get_message(chat_id_, pinned_message_id_);
+        const MessageInfo *pinned_message = client_->get_message(chat_id_, pinned_message_id_, true);
         if (pinned_message != nullptr) {
           object("pinned_message", JsonMessage(pinned_message, false, "pin in JsonChat", client_));
         } else {
@@ -1347,6 +1381,49 @@ class Client::JsonPollAnswer final : public Jsonable {
   const Client *client_;
 };
 
+class Client::JsonForumTopicCreated final : public Jsonable {
+ public:
+  explicit JsonForumTopicCreated(const td_api::messageForumTopicCreated *forum_topic_created)
+      : forum_topic_created_(forum_topic_created) {
+  }
+  void store(JsonValueScope *scope) const {
+    auto object = scope->enter_object();
+    object("name", forum_topic_created_->name_);
+    object("icon_color", forum_topic_created_->icon_->color_);
+    if (forum_topic_created_->icon_->custom_emoji_id_ != 0) {
+      object("icon_custom_emoji_id", td::to_string(forum_topic_created_->icon_->custom_emoji_id_));
+    }
+  }
+
+ private:
+  const td_api::messageForumTopicCreated *forum_topic_created_;
+};
+
+class Client::JsonForumTopicIsClosedToggled final : public Jsonable {
+ public:
+  void store(JsonValueScope *scope) const {
+    auto object = scope->enter_object();
+  }
+};
+
+class Client::JsonForumTopicInfo final : public Jsonable {
+ public:
+  explicit JsonForumTopicInfo(const td_api::forumTopicInfo *forum_topic_info) : forum_topic_info_(forum_topic_info) {
+  }
+  void store(JsonValueScope *scope) const {
+    auto object = scope->enter_object();
+    object("message_thread_id", as_client_message_id(forum_topic_info_->message_thread_id_));
+    object("name", forum_topic_info_->name_);
+    object("icon_color", forum_topic_info_->icon_->color_);
+    if (forum_topic_info_->icon_->custom_emoji_id_ != 0) {
+      object("icon_custom_emoji_id", td::to_string(forum_topic_info_->icon_->custom_emoji_id_));
+    }
+  }
+
+ private:
+  const td_api::forumTopicInfo *forum_topic_info_;
+};
+
 class Client::JsonAddress final : public Jsonable {
  public:
   explicit JsonAddress(const td_api::address *address) : address_(address) {
@@ -1747,6 +1824,9 @@ void Client::JsonMessage::store(JsonValueScope *scope) const {
   if (message_->edit_date > 0) {
     object("edit_date", message_->edit_date);
   }
+  if (message_->message_thread_id != 0) {
+    object("message_thread_id", as_client_message_id(message_->message_thread_id));
+  }
   if (message_->initial_send_date > 0) {
     if (message_->initial_sender_user_id != 0) {
       object("forward_from", JsonUser(message_->initial_sender_user_id, client_));
@@ -1772,7 +1852,7 @@ void Client::JsonMessage::store(JsonValueScope *scope) const {
     object("forward_date", message_->initial_send_date);
   }
   if (message_->reply_to_message_id > 0 && need_reply_ && !message_->is_reply_to_message_deleted) {
-    const MessageInfo *reply_to_message = client_->get_message(message_->chat_id, message_->reply_to_message_id);
+    const MessageInfo *reply_to_message = client_->get_message(message_->chat_id, message_->reply_to_message_id, true);
     if (reply_to_message != nullptr) {
       object("reply_to_message", JsonMessage(reply_to_message, false, "reply in " + source_, client_));
     } else {
@@ -1956,11 +2036,33 @@ void Client::JsonMessage::store(JsonValueScope *scope) const {
       object("migrate_from_chat_id", td::JsonLong(chat_id));
       break;
     }
+    case td_api::messageForumTopicCreated::ID: {
+      auto content = static_cast<const td_api::messageForumTopicCreated *>(message_->content.get());
+      object("forum_topic_created", JsonForumTopicCreated(content));
+      break;
+    }
+    case td_api::messageForumTopicEdited::ID:
+      break;
+    case td_api::messageForumTopicIsClosedToggled::ID: {
+      auto content = static_cast<const td_api::messageForumTopicIsClosedToggled *>(message_->content.get());
+      if (content->is_closed_) {
+        object("forum_topic_closed", JsonForumTopicIsClosedToggled());
+      } else {
+        object("forum_topic_reopened", JsonForumTopicIsClosedToggled());
+      }
+      break;
+    }
+    case td_api::messageForumTopicIsHiddenToggled::ID: {
+      // auto content = static_cast<const td_api::messageForumTopicIsHiddenToggled *>(message_->content.get());
+      // temporary; the topic is closed when it is hidden or unhidden
+      object("forum_topic_closed", JsonForumTopicIsClosedToggled());
+      break;
+    }
     case td_api::messagePinMessage::ID: {
       auto content = static_cast<const td_api::messagePinMessage *>(message_->content.get());
       auto message_id = content->message_id_;
       if (message_id > 0) {
-        const MessageInfo *pinned_message = client_->get_message(message_->chat_id, message_id);
+        const MessageInfo *pinned_message = client_->get_message(message_->chat_id, message_id, true);
         if (pinned_message != nullptr) {
           object("pinned_message", JsonMessage(pinned_message, false, "pin in " + source_, client_));
         } else {
@@ -2068,6 +2170,9 @@ void Client::JsonMessage::store(JsonValueScope *scope) const {
   }
   if (!message_->can_be_saved) {
     object("has_protected_content", td::JsonTrue());
+  }
+  if (message_->is_topic_message) {
+    object("is_topic_message", td::JsonTrue());
   }
 }
 
@@ -2704,13 +2809,12 @@ class Client::TdOnAuthorizationCallback final : public TdQueryCallback {
     bool was_ready = client_->authorization_state_->get_id() != td_api::authorizationStateWaitPhoneNumber::ID;
     if (result->get_id() == td_api::error::ID) {
       auto error = move_object_as<td_api::error>(result);
-      if (error->code_ == 429 || error->code_ >= 500 || (error->code_ != 401 && was_ready)) {
+      if (error->code_ != 401 && was_ready) {
         // try again
         return client_->on_update_authorization_state();
       }
 
-      LOG(WARNING) << "Logging out due to " << td::oneline(to_string(error));
-      client_->log_out(error->message_ == "API_ID_INVALID");
+      client_->log_out(error->code_, error->message_);
     } else if (was_ready) {
       client_->on_update_authorization_state();
     }
@@ -2759,11 +2863,13 @@ class Client::TdOnGetUserProfilePhotosCallback final : public TdQueryCallback {
 
 class Client::TdOnSendMessageCallback final : public TdQueryCallback {
  public:
-  TdOnSendMessageCallback(Client *client, PromisedQueryPtr query) : client_(client), query_(std::move(query)) {
+  TdOnSendMessageCallback(Client *client, int64 chat_id, PromisedQueryPtr query)
+      : client_(client), chat_id_(chat_id), query_(std::move(query)) {
   }
 
   void on_result(object_ptr<td_api::Object> result) final {
     if (result->get_id() == td_api::error::ID) {
+      client_->decrease_yet_unsent_message_count(chat_id_, 1);
       return fail_query_with_error(std::move(query_), move_object_as<td_api::error>(result));
     }
 
@@ -2774,21 +2880,27 @@ class Client::TdOnSendMessageCallback final : public TdQueryCallback {
 
  private:
   Client *client_;
+  int64 chat_id_;
   PromisedQueryPtr query_;
 };
 
 class Client::TdOnSendMessageAlbumCallback final : public TdQueryCallback {
  public:
-  TdOnSendMessageAlbumCallback(Client *client, PromisedQueryPtr query) : client_(client), query_(std::move(query)) {
+  TdOnSendMessageAlbumCallback(Client *client, int64 chat_id, std::size_t message_count, PromisedQueryPtr query)
+      : client_(client), chat_id_(chat_id), message_count_(message_count), query_(std::move(query)) {
   }
 
   void on_result(object_ptr<td_api::Object> result) final {
     if (result->get_id() == td_api::error::ID) {
+      if (message_count_ > 0) {
+        client_->decrease_yet_unsent_message_count(chat_id_, static_cast<int32>(message_count_));
+      }
       return fail_query_with_error(std::move(query_), move_object_as<td_api::error>(result));
     }
 
     CHECK(result->get_id() == td_api::messages::ID);
     auto messages = move_object_as<td_api::messages>(result);
+    CHECK(messages->messages_.size() == message_count_);
     auto query_id = client_->get_send_message_query_id(std::move(query_), true);
     for (auto &message : messages->messages_) {
       client_->on_sent_message(std::move(message), query_id);
@@ -2797,6 +2909,8 @@ class Client::TdOnSendMessageAlbumCallback final : public TdQueryCallback {
 
  private:
   Client *client_;
+  int64 chat_id_;
+  std::size_t message_count_;
   PromisedQueryPtr query_;
 };
 
@@ -2821,7 +2935,7 @@ class Client::TdOnDeleteFailedToSendMessageCallback final : public TdQueryCallba
     }
 
     CHECK(result->get_id() == td_api::ok::ID);
-    if (client_->get_message(chat_id_, message_id_) != nullptr) {
+    if (client_->get_message(chat_id_, message_id_, true) != nullptr) {
       LOG(ERROR) << "Have cache for message " << message_id_ << " in the chat " << chat_id_;
       client_->delete_message(chat_id_, message_id_, false);
     }
@@ -2849,7 +2963,7 @@ class Client::TdOnEditMessageCallback final : public TdQueryCallback {
     int64 chat_id = message->chat_id_;
     int64 message_id = message->id_;
 
-    auto message_info = client_->get_message(chat_id, message_id);
+    auto message_info = client_->get_message(chat_id, message_id, true);
     if (message_info == nullptr) {
       return fail_query_with_error(std::move(query_), 400, "message not found");
     }
@@ -2892,7 +3006,7 @@ class Client::TdOnStopPollCallback final : public TdQueryCallback {
     }
 
     CHECK(result->get_id() == td_api::ok::ID);
-    auto message_info = client_->get_message(chat_id_, message_id_);
+    auto message_info = client_->get_message(chat_id_, message_id_, true);
     if (message_info == nullptr) {
       return fail_query_with_error(std::move(query_), 400, "message not found");
     }
@@ -3119,6 +3233,55 @@ class Client::TdOnCheckMessageCallback final : public TdQueryCallback {
   int64 message_id_;
   bool allow_empty_;
   Slice message_type_;
+  PromisedQueryPtr query_;
+  OnSuccess on_success_;
+};
+
+template <class OnSuccess>
+class Client::TdOnCheckMessageThreadCallback final : public TdQueryCallback {
+ public:
+  TdOnCheckMessageThreadCallback(Client *client, int64 chat_id, int64 message_thread_id, int64 reply_to_message_id,
+                                 PromisedQueryPtr query, OnSuccess on_success)
+      : client_(client)
+      , chat_id_(chat_id)
+      , message_thread_id_(message_thread_id)
+      , reply_to_message_id_(reply_to_message_id)
+      , query_(std::move(query))
+      , on_success_(std::move(on_success)) {
+  }
+
+  void on_result(object_ptr<td_api::Object> result) final {
+    if (result->get_id() == td_api::error::ID) {
+      auto error = move_object_as<td_api::error>(result);
+      if (error->code_ == 429) {
+        LOG(WARNING) << "Failed to get message thread " << message_thread_id_ << " in " << chat_id_;
+      }
+      return fail_query_with_error(std::move(query_), std::move(error), "Message thread not found");
+    }
+
+    CHECK(result->get_id() == td_api::message::ID);
+    auto full_message_id = client_->add_message(move_object_as<td_api::message>(result));
+    CHECK(full_message_id.chat_id == chat_id_);
+    CHECK(full_message_id.message_id == message_thread_id_);
+
+    const MessageInfo *message_info = client_->get_message(chat_id_, message_thread_id_, true);
+    CHECK(message_info != nullptr);
+    if (message_info->message_thread_id != message_thread_id_) {
+      return fail_query_with_error(std::move(query_), 400, "MESSAGE_THREAD_INVALID", "Message thread not found");
+    }
+    if (!message_info->is_topic_message) {
+      return fail_query_with_error(std::move(query_), 400, "MESSAGE_THREAD_INVALID",
+                                   "Message thread is not a forum topic thread");
+    }
+
+    on_success_(chat_id_, message_thread_id_, reply_to_message_id_, std::move(query_));
+  }
+
+ private:
+  Client *client_;
+  int64 chat_id_;
+  int64 message_thread_id_;
+  int64 reply_to_message_id_;
   PromisedQueryPtr query_;
   OnSuccess on_success_;
 };
@@ -3450,6 +3613,25 @@ class Client::TdOnGetMyDefaultAdministratorRightsCallback final : public TdQuery
 
  private:
   bool for_channels_;
+  PromisedQueryPtr query_;
+};
+
+class Client::TdOnGetForumTopicInfoCallback final : public TdQueryCallback {
+ public:
+  explicit TdOnGetForumTopicInfoCallback(PromisedQueryPtr query) : query_(std::move(query)) {
+  }
+
+  void on_result(object_ptr<td_api::Object> result) final {
+    if (result->get_id() == td_api::error::ID) {
+      return fail_query_with_error(std::move(query_), move_object_as<td_api::error>(result));
+    }
+
+    CHECK(result->get_id() == td_api::forumTopicInfo::ID);
+    auto forum_topic_info = move_object_as<td_api::forumTopicInfo>(result);
+    answer_query(JsonForumTopicInfo(forum_topic_info.get()), std::move(query_));
+  }
+
+ private:
   PromisedQueryPtr query_;
 };
 
@@ -3803,8 +3985,18 @@ void Client::close() {
   }
 }
 
-void Client::log_out(bool is_api_id_invalid) {
-  is_api_id_invalid_ |= is_api_id_invalid;
+void Client::log_out(int32 error_code, Slice error_message) {
+  LOG(WARNING) << "Logging out due to error " << error_code << ": " << error_message;
+  if (error_message == "API_ID_INVALID") {
+    is_api_id_invalid_ = true;
+  } else if (error_code == 429) {
+    auto retry_after_time = get_retry_after_time(error_message);
+    if (retry_after_time > 0) {
+      next_authorization_time_ = td::max(next_authorization_time_, td::Time::now() + retry_after_time);
+    }
+  } else if (error_code >= 500) {
+    next_authorization_time_ = td::max(next_authorization_time_, td::Time::now() + 1);
+  }
   if (!td_client_.empty() && !logging_out_ && !closing_) {
     do_send_request(make_object<td_api::logOut>(), td::make_unique<TdOnOkCallback>());
   }
@@ -3832,7 +4024,7 @@ ServerBotInfo Client::get_bot_info() const {
   res.token_ = bot_token_;
   auto user_info = get_user_info(my_id_);
   if (user_info != nullptr) {
-    res.username_ = user_info->username;
+    res.username_ = user_info->editable_username;
   } else if (!was_authorized_) {
     res.username_ = "<unauthorized>";
   } else {
@@ -3908,13 +4100,33 @@ void Client::start_up() {
   };
   td::ClientActor::Options options;
   options.net_query_stats = parameters_->net_query_stats_;
-  td_client_ = td::create_actor<td::ClientActor>("TdClientActor", td::make_unique<TdCallback>(actor_id(this)),
-                                                 std::move(options));
+  td_client_ = td::create_actor_on_scheduler<td::ClientActor>(
+      "TdClientActor", 0, td::make_unique<TdCallback>(actor_id(this)), std::move(options));
 }
 
 void Client::send(PromisedQueryPtr query) {
   if (!query->is_internal()) {
     query->set_stat_actor(stat_actor_);
+    if (!parameters_->local_mode_ && !is_local_method(query->method()) &&
+        td::Time::now() > parameters_->start_time_ + 10 * 60) {
+      BotStatActor *stat = stat_actor_.get_actor_unsafe();
+      auto update_per_minute = static_cast<int64>(stat->get_minute_update_count(td::Time::now()) * 60);
+      if (stat->get_active_request_count() > 500 + update_per_minute) {
+        LOG(INFO) << "Fail a query, because there are too many active queries: " << *query;
+        flood_limited_query_count_++;
+        return query->set_retry_after_error(60);
+      }
+      if (stat->get_active_file_upload_bytes() > (static_cast<int64>(1) << 33) && !query->files().empty()) {
+        LOG(INFO) << "Fail a query, because the total size of active file uploads is too big: " << *query;
+        flood_limited_query_count_++;
+        return query->set_retry_after_error(60);
+      }
+      if (stat->get_active_file_upload_count() > 100 + update_per_minute / 5 && !query->files().empty()) {
+        LOG(INFO) << "Fail a query, because there are too many active file uploads: " << *query;
+        flood_limited_query_count_++;
+        return query->set_retry_after_error(60);
+      }
+    }
   }
   cmd_queue_.emplace(std::move(query));
   loop();
@@ -3955,7 +4167,7 @@ void Client::on_get_reply_message(int64 chat_id, object_ptr<td_api::message> rep
     add_message(std::move(reply_to_message));
   }
 
-  process_new_message_queue(chat_id);
+  process_new_message_queue(chat_id, 1);
 }
 
 void Client::on_get_edited_message(object_ptr<td_api::message> edited_message) {
@@ -4029,7 +4241,7 @@ void Client::on_get_sticker_set(int64 set_id, int64 new_callback_query_user_id, 
     process_new_callback_query_queue(new_callback_query_user_id, 2);
   }
   if (new_message_chat_id != 0) {
-    process_new_message_queue(new_message_chat_id);
+    process_new_message_queue(new_message_chat_id, 2);
   }
 }
 
@@ -4118,7 +4330,7 @@ void Client::check_chat_access(int64 chat_id, AccessRights access_rights, const 
     case ChatInfo::Type::Supergroup: {
       auto supergroup_info = get_supergroup_info(chat_info->supergroup_id);
       CHECK(supergroup_info != nullptr);
-      bool is_public = !supergroup_info->username.empty() || supergroup_info->has_location;
+      bool is_public = !supergroup_info->active_usernames.empty() || supergroup_info->has_location;
       if (supergroup_info->status->get_id() == td_api::chatMemberStatusBanned::ID) {
         if (supergroup_info->is_supergroup) {
           return fail_query(403, "Forbidden: bot was kicked from the supergroup chat", std::move(query));
@@ -4281,6 +4493,30 @@ void Client::check_message(Slice chat_id_str, int64 message_id, bool allow_empty
 }
 
 template <class OnSuccess>
+void Client::check_message_thread(int64 chat_id, int64 message_thread_id, int64 reply_to_message_id,
+                                  PromisedQueryPtr query, OnSuccess on_success) {
+  if (message_thread_id <= 0) {
+    return on_success(chat_id, 0, reply_to_message_id, std::move(query));
+  }
+
+  if (reply_to_message_id != 0) {
+    const MessageInfo *message_info = get_message(chat_id, reply_to_message_id, true);
+    CHECK(message_info != nullptr);
+    if (message_info->message_thread_id != message_thread_id) {
+      return fail_query_with_error(std::move(query), 400, "MESSAGE_THREAD_INVALID",
+                                   "Replied message is not in the specified message thread");
+    }
+  }
+  if (reply_to_message_id == message_thread_id) {
+    return on_success(chat_id, message_thread_id, reply_to_message_id, std::move(query));
+  }
+
+  send_request(make_object<td_api::getMessage>(chat_id, message_thread_id),
+               td::make_unique<TdOnCheckMessageThreadCallback<OnSuccess>>(
+                   this, chat_id, message_thread_id, reply_to_message_id, std::move(query), std::move(on_success)));
+}
+
+template <class OnSuccess>
 void Client::resolve_sticker_set(const td::string &sticker_set_name, PromisedQueryPtr query, OnSuccess on_success) {
   if (sticker_set_name.empty()) {
     return fail_query(400, "Bad Request: sticker_set_name is empty", std::move(query));
@@ -4426,12 +4662,9 @@ void Client::get_chat_member(int64 chat_id, int64 user_id, PromisedQueryPtr quer
 }
 
 void Client::send_request(object_ptr<td_api::Function> &&f, td::unique_ptr<TdQueryCallback> handler) {
-  if (logging_out_) {
-    return handler->on_result(
-        make_object<td_api::error>(LOGGING_OUT_ERROR_CODE, get_logging_out_error_description().str()));
-  }
-  if (closing_) {
-    return handler->on_result(make_object<td_api::error>(CLOSING_ERROR_CODE, CLOSING_ERROR_DESCRIPTION.str()));
+  if (closing_ || logging_out_) {
+    auto error = get_closing_error();
+    return handler->on_result(make_object<td_api::error>(error.code, error.message.str()));
   }
 
   do_send_request(std::move(f), std::move(handler));
@@ -4464,13 +4697,12 @@ void Client::on_update_file(object_ptr<td_api::file> file) {
   }
   if (!file->local_->is_downloading_active_ && download_started_file_ids_.count(file_id)) {
     // also includes all 5xx and 429 errors
+    if (closing_ || logging_out_) {
+      auto error = get_closing_error();
+      return on_file_download(file_id, Status::Error(error.code, error.message));
+    }
+
     auto error = Status::Error(400, "Bad Request: wrong file_id or the file is temporarily unavailable");
-    if (logging_out_) {
-      error = Status::Error(LOGGING_OUT_ERROR_CODE, get_logging_out_error_description());
-    }
-    if (closing_) {
-      error = Status::Error(CLOSING_ERROR_CODE, CLOSING_ERROR_DESCRIPTION);
-    }
     return on_file_download(file_id, std::move(error));
   }
 }
@@ -4492,27 +4724,23 @@ void Client::on_update_authorization_state() {
                                                   make_object<td_api::optionValueBoolean>(true)),
                    td::make_unique<TdOnOkCallback>());
 
-      auto parameters = make_object<td_api::tdlibParameters>();
+      auto request = make_object<td_api::setTdlibParameters>();
+      request->use_test_dc_ = is_test_dc_;
+      request->database_directory_ = dir_;
+      //request->use_file_database_ = false;
+      //request->use_chat_info_database_ = false;
+      //request->use_secret_chats_ = false;
+      request->use_message_database_ = USE_MESSAGE_DATABASE;
+      request->api_id_ = parameters_->api_id_;
+      request->api_hash_ = parameters_->api_hash_;
+      request->system_language_code_ = "en";
+      request->device_model_ = "server";
+      request->application_version_ = parameters_->version_;
+      request->enable_storage_optimizer_ = true;
+      request->ignore_file_names_ = true;
 
-      parameters->use_test_dc_ = is_test_dc_;
-      parameters->database_directory_ = dir_;
-      //parameters->use_file_database_ = false;
-      //parameters->use_chat_info_database_ = false;
-      //parameters->use_secret_chats_ = false;
-      parameters->use_message_database_ = USE_MESSAGE_DATABASE;
-      parameters->api_id_ = parameters_->api_id_;
-      parameters->api_hash_ = parameters_->api_hash_;
-      parameters->system_language_code_ = "en";
-      parameters->device_model_ = "server";
-      parameters->application_version_ = parameters_->version_;
-      parameters->enable_storage_optimizer_ = true;
-      parameters->ignore_file_names_ = true;
-
-      return send_request(make_object<td_api::setTdlibParameters>(std::move(parameters)),
-                          td::make_unique<TdOnInitCallback>(this));
+      return send_request(std::move(request), td::make_unique<TdOnInitCallback>(this));
     }
-    case td_api::authorizationStateWaitEncryptionKey::ID:
-      return send_request(make_object<td_api::checkDatabaseEncryptionKey>(), td::make_unique<TdOnInitCallback>(this));
     case td_api::authorizationStateWaitPhoneNumber::ID:
       send_request(make_object<td_api::setOption>("online", make_object<td_api::optionValueBoolean>(true)),
                    td::make_unique<TdOnOkCallback>());
@@ -4526,7 +4754,7 @@ void Client::on_update_authorization_state() {
       }
 
       if (!was_authorized_) {
-        LOG(WARNING) << "Logged in as @" << user_info->username;
+        LOG(WARNING) << "Logged in as @" << user_info->editable_username;
         was_authorized_ = true;
         td::send_event(parent_, td::Event::raw(static_cast<void *>(this)));
         update_shared_unix_time_difference();
@@ -4564,7 +4792,7 @@ void Client::on_update_authorization_state() {
     case td_api::authorizationStateClosed::ID:
       return on_closed();
     default:
-      return log_out(false);  // just in case
+      return log_out(500, "Unknown authorization state");  // just in case
   }
 }
 
@@ -4636,9 +4864,14 @@ void Client::on_update(object_ptr<td_api::Object> result) {
     }
     case td_api::updateDeleteMessages::ID: {
       auto update = move_object_as<td_api::updateDeleteMessages>(result);
+      td::vector<td::unique_ptr<MessageInfo>> deleted_messages;
       for (auto message_id : update->message_ids_) {
-        delete_message(update->chat_id_, message_id, update->from_cache_);
+        auto deleted_message = delete_message(update->chat_id_, message_id, update->from_cache_);
+        if (deleted_message != nullptr) {
+          deleted_messages.push_back(std::move(deleted_message));
+        }
       }
+      td::Scheduler::instance()->destroy_on_scheduler(SharedData::get_file_gc_scheduler_id(), deleted_messages);
       break;
     }
     case td_api::updateFile::ID: {
@@ -4903,6 +5136,12 @@ void Client::on_update(object_ptr<td_api::Object> result) {
 
 void Client::on_result(td::uint64 id, object_ptr<td_api::Object> result) {
   LOG(DEBUG) << "Receive from Td: " << id << " " << to_string(result);
+  if (flood_limited_query_count_ > 0 && td::Time::now() > next_flood_limit_warning_time_) {
+    LOG(WARNING) << "Flood-limited " << flood_limited_query_count_ << " queries";
+    flood_limited_query_count_ = 0;
+    next_flood_limit_warning_time_ = td::Time::now() + 1;
+  }
+
   if (id == 0) {
     return on_update(std::move(result));
   }
@@ -4914,20 +5153,17 @@ void Client::on_result(td::uint64 id, object_ptr<td_api::Object> result) {
   handlers_.erase(id);
 }
 
-td::Slice Client::get_logging_out_error_description() const {
-  return is_api_id_invalid_ ? API_ID_INVALID_ERROR_DESCRIPTION : LOGGING_OUT_ERROR_DESCRIPTION;
-}
-
 void Client::on_closed() {
   LOG(WARNING) << "Closed";
   CHECK(logging_out_ || closing_);
   CHECK(!td_client_.empty());
   td_client_.reset();
 
-  int http_status_code = logging_out_ ? LOGGING_OUT_ERROR_CODE : CLOSING_ERROR_CODE;
-  Slice description = logging_out_ ? get_logging_out_error_description() : CLOSING_ERROR_DESCRIPTION;
   if (webhook_set_query_) {
-    fail_query(http_status_code, description, std::move(webhook_set_query_));
+    fail_query_closing(std::move(webhook_set_query_));
+  }
+  if (active_webhook_set_query_) {
+    fail_query_closing(std::move(active_webhook_set_query_));
   }
   if (!webhook_url_.empty()) {
     webhook_id_.reset();
@@ -4940,23 +5176,24 @@ void Client::on_closed() {
   while (!cmd_queue_.empty()) {
     auto query = std::move(cmd_queue_.front());
     cmd_queue_.pop();
-    fail_query(http_status_code, description, std::move(query));
+    fail_query_closing(std::move(query));
   }
 
-  while (!yet_unsent_messages_.empty()) {
-    auto it = yet_unsent_messages_.begin();
-    auto chat_id = it->first.chat_id;
-    auto message_id = it->first.message_id;
+  while (!pending_send_message_queries_.empty()) {
+    auto it = pending_send_message_queries_.begin();
     if (!USE_MESSAGE_DATABASE) {
-      LOG(ERROR) << "Doesn't receive updateMessageSendFailed for message " << message_id << " in chat " << chat_id;
+      LOG(ERROR) << "Doesn't receive updateMessageSendFailed for " << *it->second->query << " with "
+                 << it->second->awaited_message_count << " awaited messages";
     }
-    on_message_send_failed(chat_id, message_id, 0, Status::Error(http_status_code, description));
+    fail_query_closing(std::move(it->second->query));
+    pending_send_message_queries_.erase(it);
   }
-  CHECK(yet_unsent_message_count_.empty());
+  yet_unsent_message_count_.clear();
+  yet_unsent_messages_.clear();
 
   while (!pending_bot_resolve_queries_.empty()) {
     auto it = pending_bot_resolve_queries_.begin();
-    fail_query(http_status_code, description, std::move(it->second.query));
+    fail_query_closing(std::move(it->second.query));
     pending_bot_resolve_queries_.erase(it);
   }
 
@@ -4964,13 +5201,18 @@ void Client::on_closed() {
     auto it = file_download_listeners_.begin();
     auto file_id = it->first;
     LOG(ERROR) << "Doesn't receive updateFile for file " << file_id;
-    on_file_download(file_id, Status::Error(http_status_code, description));
+    auto queries = std::move(it->second);
+    file_download_listeners_.erase(it);
+    for (auto &query : queries) {
+      fail_query_closing(std::move(query));
+    }
   }
+  download_started_file_ids_.clear();
 
   if (logging_out_) {
     parameters_->shared_data_->webhook_db_->erase(bot_token_with_dc_);
 
-    td::Scheduler::instance()->run_on_scheduler(get_file_gc_scheduler_id(),
+    td::Scheduler::instance()->run_on_scheduler(SharedData::get_file_gc_scheduler_id(),
                                                 [actor_id = actor_id(this), dir = dir_](td::Unit) {
                                                   CHECK(dir.size() >= 24);
                                                   CHECK(dir.back() == TD_DIR_SLASH);
@@ -4988,7 +5230,18 @@ void Client::finish_closing() {
     clear_tqueue();
   }
 
-  set_timeout_in(need_close_ ? 0 : 600);
+  if (need_close_) {
+    return stop();
+  }
+
+  auto timeout = [&] {
+    if (next_authorization_time_ <= 0.0) {
+      return 600.0;
+    }
+    return td::min(next_authorization_time_ - td::Time::now(), 600.0);
+  }();
+  set_timeout_in(timeout);
+  LOG(INFO) << "Keep client opened for " << timeout << " seconds";
 }
 
 void Client::timeout_expired() {
@@ -4996,32 +5249,10 @@ void Client::timeout_expired() {
   stop();
 }
 
-td::int32 Client::get_database_scheduler_id() {
-  // the same scheduler as for database in Td
-  auto current_scheduler_id = td::Scheduler::instance()->sched_id();
-  auto scheduler_count = td::Scheduler::instance()->sched_count();
-  return td::min(current_scheduler_id + 1, scheduler_count - 1);
-}
-
-td::int32 Client::get_file_gc_scheduler_id() {
-  // the same scheduler as for file GC in Td
-  auto current_scheduler_id = td::Scheduler::instance()->sched_id();
-  auto scheduler_count = td::Scheduler::instance()->sched_count();
-  return td::min(current_scheduler_id + 2, scheduler_count - 1);
-}
-
 void Client::clear_tqueue() {
   CHECK(webhook_id_.empty());
   auto &tqueue = parameters_->shared_data_->tqueue_;
-  auto size = tqueue->get_size(tqueue_id_);
-  if (size > 0) {
-    LOG(INFO) << "Removing " << size << " tqueue events";
-    td::MutableSpan<td::TQueue::Event> span;
-    auto r_size = tqueue->get(tqueue_id_, tqueue->get_tail(tqueue_id_), true, 0, span);
-    CHECK(r_size.is_ok());
-    CHECK(r_size.ok() == 0);
-    CHECK(tqueue->get_size(tqueue_id_) == 0);
-  }
+  tqueue->clear(tqueue_id_, 0);
 }
 
 bool Client::to_bool(td::MutableSlice value) {
@@ -5148,7 +5379,7 @@ td::Result<td_api::object_ptr<td_api::inlineKeyboardButton>> Client::get_inline_
         }
       }
       if (cur_temp_bot_user_id_ >= 100000) {
-        return Status::Error(400, "Too much different LoginUrl bot usernames");
+        return Status::Error(400, "Too many different LoginUrl bot usernames");
       }
       auto &user_id = bot_user_ids_[bot_username];
       if (user_id == 0) {
@@ -5627,7 +5858,7 @@ td::Result<td_api::object_ptr<td_api::InputMessageContent>> Client::get_input_me
                                      need_shipping_address, send_phone_number_to_provider,
                                      send_email_address_to_provider, is_flexible),
         title, description, photo_url, photo_size, photo_width, photo_height, payload, provider_token, provider_data,
-        td::string());
+        td::string(), nullptr);
   }
 
   if (is_input_message_content_required) {
@@ -5638,7 +5869,7 @@ td::Result<td_api::object_ptr<td_api::InputMessageContent>> Client::get_input_me
 
 td_api::object_ptr<td_api::messageSendOptions> Client::get_message_send_options(bool disable_notification,
                                                                                 bool protect_content) {
-  return make_object<td_api::messageSendOptions>(disable_notification, false, protect_content, nullptr);
+  return make_object<td_api::messageSendOptions>(disable_notification, false, protect_content, false, nullptr);
 }
 
 td::Result<td::vector<td_api::object_ptr<td_api::InputInlineQueryResult>>> Client::get_inline_query_results(
@@ -6144,12 +6375,14 @@ td::Result<td_api::object_ptr<td_api::chatAdministratorRights>> Client::get_chat
   TRY_RESULT(can_invite_users, get_json_object_bool_field(object, "can_invite_users"));
   TRY_RESULT(can_restrict_members, get_json_object_bool_field(object, "can_restrict_members"));
   TRY_RESULT(can_pin_messages, get_json_object_bool_field(object, "can_pin_messages"));
+  TRY_RESULT(can_manage_topics, get_json_object_bool_field(object, "can_manage_topics"));
   TRY_RESULT(can_promote_members, get_json_object_bool_field(object, "can_promote_members"));
   TRY_RESULT(can_manage_video_chats, get_json_object_bool_field(object, "can_manage_video_chats"));
   TRY_RESULT(is_anonymous, get_json_object_bool_field(object, "is_anonymous"));
-  return make_object<td_api::chatAdministratorRights>(
-      can_manage_chat, can_change_info, can_post_messages, can_edit_messages, can_delete_messages, can_invite_users,
-      can_restrict_members, can_pin_messages, can_promote_members, can_manage_video_chats, is_anonymous);
+  return make_object<td_api::chatAdministratorRights>(can_manage_chat, can_change_info, can_post_messages,
+                                                      can_edit_messages, can_delete_messages, can_invite_users,
+                                                      can_restrict_members, can_pin_messages, can_manage_topics,
+                                                      can_promote_members, can_manage_video_chats, is_anonymous);
 }
 
 td::Result<td_api::object_ptr<td_api::chatAdministratorRights>> Client::get_chat_administrator_rights(
@@ -6573,6 +6806,7 @@ td::Result<td_api::object_ptr<td_api::chatPermissions>> Client::get_chat_permiss
   auto can_change_info = false;
   auto can_invite_users = false;
   auto can_pin_messages = false;
+  auto can_manage_topics = false;
 
   if (query->has_arg("permissions")) {
     allow_legacy = false;
@@ -6598,11 +6832,16 @@ td::Result<td_api::object_ptr<td_api::chatPermissions>> Client::get_chat_permiss
       TRY_RESULT_ASSIGN(can_change_info, get_json_object_bool_field(object, "can_change_info"));
       TRY_RESULT_ASSIGN(can_invite_users, get_json_object_bool_field(object, "can_invite_users"));
       TRY_RESULT_ASSIGN(can_pin_messages, get_json_object_bool_field(object, "can_pin_messages"));
+      if (has_json_object_field(object, "can_manage_topics")) {
+        TRY_RESULT_ASSIGN(can_manage_topics, get_json_object_bool_field(object, "can_manage_topics"));
+      } else {
+        can_manage_topics = can_pin_messages;
+      }
       return Status::OK();
     }();
 
     if (status.is_error()) {
-      return Status::Error(400, PSLICE() << "Can't parse chat permissions: " << status.error().message());
+      return Status::Error(400, PSLICE() << "Can't parse chat permissions: " << status.message());
     }
   } else if (allow_legacy) {
     allow_legacy = false;
@@ -6618,6 +6857,7 @@ td::Result<td_api::object_ptr<td_api::chatPermissions>> Client::get_chat_permiss
       can_change_info = true;
       can_invite_users = true;
       can_pin_messages = true;
+      can_manage_topics = true;
     } else if (query->has_arg("can_send_messages") || query->has_arg("can_send_media_messages") ||
                query->has_arg("can_send_other_messages") || query->has_arg("can_add_web_page_previews")) {
       allow_legacy = true;
@@ -6629,14 +6869,14 @@ td::Result<td_api::object_ptr<td_api::chatPermissions>> Client::get_chat_permiss
   }
   return make_object<td_api::chatPermissions>(can_send_messages, can_send_media_messages, can_send_polls,
                                               can_send_other_messages, can_add_web_page_previews, can_change_info,
-                                              can_invite_users, can_pin_messages);
+                                              can_invite_users, can_pin_messages, can_manage_topics);
 }
 
 td::Result<td_api::object_ptr<td_api::InputMessageContent>> Client::get_input_media(const Query *query,
                                                                                     JsonValue &&input_media,
                                                                                     bool for_album) const {
   if (input_media.type() != JsonValue::Type::Object) {
-    return Status::Error(400, "expected an Object");
+    return Status::Error("expected an Object");
   }
 
   auto &object = input_media.get_object();
@@ -6651,7 +6891,7 @@ td::Result<td_api::object_ptr<td_api::InputMessageContent>> Client::get_input_me
 
   auto input_file = get_input_file(query, Slice(), media, false);
   if (input_file == nullptr) {
-    return Status::Error(400, "media not found");
+    return Status::Error("media not found");
   }
 
   TRY_RESULT(thumbnail, get_json_object_string_field(object, "thumb"));
@@ -6680,7 +6920,7 @@ td::Result<td_api::object_ptr<td_api::InputMessageContent>> Client::get_input_me
                                                   std::move(caption), ttl);
   }
   if (for_album && type == "animation") {
-    return Status::Error(400, PSLICE() << "type \"" << type << "\" can't be used in sendMediaGroup");
+    return Status::Error(PSLICE() << "type \"" << type << "\" can't be used in sendMediaGroup");
   }
   if (type == "animation") {
     TRY_RESULT(width, get_json_object_int_field(object, "width"));
@@ -6706,12 +6946,11 @@ td::Result<td_api::object_ptr<td_api::InputMessageContent>> Client::get_input_me
                                                      disable_content_type_detection || for_album, std::move(caption));
   }
 
-  return Status::Error(400, PSLICE() << "type \"" << type << "\" is unsupported");
+  return Status::Error(PSLICE() << "type \"" << type << "\" is unsupported");
 }
 
 td::Result<td_api::object_ptr<td_api::InputMessageContent>> Client::get_input_media(const Query *query,
-                                                                                    Slice field_name,
-                                                                                    bool for_album) const {
+                                                                                    Slice field_name) const {
   TRY_RESULT(media, get_required_string_arg(query, field_name));
 
   LOG(INFO) << "Parsing JSON object: " << media;
@@ -6721,7 +6960,7 @@ td::Result<td_api::object_ptr<td_api::InputMessageContent>> Client::get_input_me
     return Status::Error(400, "Can't parse input media JSON object");
   }
 
-  auto r_input_message_content = get_input_media(query, r_value.move_as_ok(), for_album);
+  auto r_input_message_content = get_input_media(query, r_value.move_as_ok(), false);
   if (r_input_message_content.is_error()) {
     return Status::Error(400, PSLICE() << "Can't parse InputMedia: " << r_input_message_content.error().message());
   }
@@ -6750,13 +6989,17 @@ td::Result<td::vector<td_api::object_ptr<td_api::InputMessageContent>>> Client::
 
   td::vector<object_ptr<td_api::InputMessageContent>> contents;
   for (auto &input_media : value.get_array()) {
-    TRY_RESULT(input_message_content, get_input_media(query, std::move(input_media), true));
-    contents.push_back(std::move(input_message_content));
+    auto r_input_message_content = get_input_media(query, std::move(input_media), true);
+    if (r_input_message_content.is_error()) {
+      return Status::Error(400, PSLICE() << "Can't parse InputMedia: " << r_input_message_content.error().message());
+    }
+    contents.push_back(r_input_message_content.move_as_ok());
   }
   return std::move(contents);
 }
 
-td::Result<td_api::object_ptr<td_api::inputMessageInvoice>> Client::get_input_message_invoice(const Query *query) {
+td::Result<td_api::object_ptr<td_api::inputMessageInvoice>> Client::get_input_message_invoice(
+    const Query *query) const {
   TRY_RESULT(title, get_required_string_arg(query, "title"));
   TRY_RESULT(description, get_required_string_arg(query, "description"));
   TRY_RESULT(payload, get_required_string_arg(query, "payload"));
@@ -6812,13 +7055,18 @@ td::Result<td_api::object_ptr<td_api::inputMessageInvoice>> Client::get_input_me
   auto send_email_address_to_provider = to_bool(query->arg("send_email_to_provider"));
   auto is_flexible = to_bool(query->arg("is_flexible"));
 
+  object_ptr<td_api::InputMessageContent> extended_media;
+  if (!query->arg("extended_media").empty()) {
+    TRY_RESULT_ASSIGN(extended_media, get_input_media(query, "extended_media"));
+  }
+
   return make_object<td_api::inputMessageInvoice>(
       make_object<td_api::invoice>(currency.str(), std::move(prices), max_tip_amount, std::move(suggested_tip_amounts),
                                    td::string(), false, need_name, need_phone_number, need_email_address,
                                    need_shipping_address, send_phone_number_to_provider, send_email_address_to_provider,
                                    is_flexible),
       title.str(), description.str(), photo_url.str(), photo_size, photo_width, photo_height, payload.str(),
-      provider_token.str(), provider_data.str(), start_parameter.str());
+      provider_token.str(), provider_data.str(), start_parameter.str(), std::move(extended_media));
 }
 
 td::Result<td::vector<td::string>> Client::get_poll_options(const Query *query) {
@@ -6890,6 +7138,16 @@ td::Result<td::int64> Client::get_user_id(const Query *query, Slice field_name) 
   return user_id;
 }
 
+void Client::decrease_yet_unsent_message_count(int64 chat_id, int32 count) {
+  auto count_it = yet_unsent_message_count_.find(chat_id);
+  CHECK(count_it != yet_unsent_message_count_.end());
+  CHECK(count_it->second >= count);
+  count_it->second -= count;
+  if (count_it->second == 0) {
+    yet_unsent_message_count_.erase(count_it);
+  }
+}
+
 td::int64 Client::extract_yet_unsent_message_query_id(int64 chat_id, int64 message_id,
                                                       bool *is_reply_to_message_deleted) {
   auto yet_unsent_message_it = yet_unsent_messages_.find({chat_id, message_id});
@@ -6903,12 +7161,7 @@ td::int64 Client::extract_yet_unsent_message_query_id(int64 chat_id, int64 messa
 
   yet_unsent_messages_.erase(yet_unsent_message_it);
 
-  auto count_it = yet_unsent_message_count_.find(chat_id);
-  CHECK(count_it != yet_unsent_message_count_.end());
-  CHECK(count_it->second > 0);
-  if (--count_it->second == 0) {
-    yet_unsent_message_count_.erase(count_it);
-  }
+  decrease_yet_unsent_message_count(chat_id, 1);
 
   if (reply_to_message_id > 0) {
     auto it = yet_unsent_reply_message_ids_.find({chat_id, reply_to_message_id});
@@ -6930,7 +7183,7 @@ void Client::on_message_send_succeeded(object_ptr<td_api::message> &&message, in
   int64 new_message_id = full_message_id.message_id;
   CHECK(new_message_id > 0);
 
-  auto message_info = get_message(chat_id, new_message_id);
+  auto message_info = get_message(chat_id, new_message_id, true);
   CHECK(message_info != nullptr);
   message_info->is_content_changed = false;
 
@@ -6967,7 +7220,7 @@ void Client::on_message_send_failed(int64 chat_id, int64 old_message_id, int64 n
   auto &query = *pending_send_message_queries_[query_id];
   if (query.is_multisend) {
     if (query.error == nullptr || query.error->message_ == "Group send failed") {
-      if (error->code_ == 429 || error->message_ == "Group send failed") {
+      if (error->code_ == 401 || error->code_ == 429 || error->code_ >= 500 || error->message_ == "Group send failed") {
         query.error = std::move(error);
       } else {
         auto pos = (query.total_message_count - query.awaited_message_count + 1);
@@ -6996,7 +7249,7 @@ void Client::on_message_send_failed(int64 chat_id, int64 old_message_id, int64 n
 
 void Client::on_cmd(PromisedQueryPtr query) {
   LOG(DEBUG) << "Process query " << *query;
-  if (!td_client_.empty()) {
+  if (!td_client_.empty() && was_authorized_) {
     if (query->method() == "close") {
       auto retry_after = static_cast<int>(10 * 60 - (td::Time::now() - start_time_));
       if (retry_after > 0 && start_time_ > parameters_->start_time_ + 10 * 60) {
@@ -7011,11 +7264,8 @@ void Client::on_cmd(PromisedQueryPtr query) {
     }
   }
 
-  if (logging_out_) {
-    return fail_query(LOGGING_OUT_ERROR_CODE, get_logging_out_error_description(), std::move(query));
-  }
-  if (closing_) {
-    return fail_query(CLOSING_ERROR_CODE, CLOSING_ERROR_DESCRIPTION, std::move(query));
+  if (logging_out_ || closing_) {
+    return fail_query_closing(std::move(query));
   }
   CHECK(was_authorized_);
 
@@ -7139,6 +7389,17 @@ td::Status Client::process_get_user_profile_photos_query(PromisedQueryPtr &query
 }
 
 td::Status Client::process_send_message_query(PromisedQueryPtr &query) {
+  auto r_chat_id = td::to_integer_safe<int64>(query->arg("chat_id"));
+  if (r_chat_id.is_ok()) {
+    // fast path
+    auto it = yet_unsent_message_count_.find(r_chat_id.ok());
+    if (it != yet_unsent_message_count_.end() && it->second >= MAX_CONCURRENTLY_SENT_CHAT_MESSAGES) {
+      flood_limited_query_count_++;
+      query->set_retry_after_error(60);
+      return Status::OK();
+    }
+  }
+
   TRY_RESULT(input_message_text, get_input_message_text(query.get()));
   do_send_message(std::move(input_message_text), std::move(query));
   return Status::OK();
@@ -7414,6 +7675,7 @@ td::Status Client::process_forward_message_query(PromisedQueryPtr &query) {
 
 td::Status Client::process_send_media_group_query(PromisedQueryPtr &query) {
   auto chat_id = query->arg("chat_id");
+  auto message_thread_id = get_message_id(query.get(), "message_thread_id");
   auto reply_to_message_id = get_message_id(query.get(), "reply_to_message_id");
   auto allow_sending_without_reply = to_bool(query->arg("allow_sending_without_reply"));
   auto disable_notification = to_bool(query->arg("disable_notification"));
@@ -7424,23 +7686,34 @@ td::Status Client::process_send_media_group_query(PromisedQueryPtr &query) {
 
   resolve_reply_markup_bot_usernames(
       std::move(reply_markup), std::move(query),
-      [this, chat_id = chat_id.str(), reply_to_message_id, allow_sending_without_reply, disable_notification,
-       protect_content, input_message_contents = std::move(input_message_contents)](
+      [this, chat_id = chat_id.str(), message_thread_id, reply_to_message_id, allow_sending_without_reply,
+       disable_notification, protect_content, input_message_contents = std::move(input_message_contents)](
           object_ptr<td_api::ReplyMarkup> reply_markup, PromisedQueryPtr query) mutable {
-        auto on_success = [this, disable_notification, protect_content,
+        auto on_success = [this, message_thread_id, disable_notification, protect_content,
                            input_message_contents = std::move(input_message_contents),
                            reply_markup = std::move(reply_markup)](int64 chat_id, int64 reply_to_message_id,
                                                                    PromisedQueryPtr query) mutable {
-          auto it = yet_unsent_message_count_.find(chat_id);
-          if (it != yet_unsent_message_count_.end() && it->second > MAX_CONCURRENTLY_SENT_CHAT_MESSAGES) {
-            return query->set_retry_after_error(60);
-          }
+          auto on_message_thread_checked = [this, disable_notification, protect_content,
+                                            input_message_contents = std::move(input_message_contents),
+                                            reply_markup = std::move(reply_markup)](
+                                               int64 chat_id, int64 message_thread_id, int64 reply_to_message_id,
+                                               PromisedQueryPtr query) mutable {
+            auto &count = yet_unsent_message_count_[chat_id];
+            if (count >= MAX_CONCURRENTLY_SENT_CHAT_MESSAGES) {
+              flood_limited_query_count_++;
+              return query->set_retry_after_error(60);
+            }
+            auto message_count = input_message_contents.size();
+            count += static_cast<int32>(message_count);
 
-          send_request(
-              make_object<td_api::sendMessageAlbum>(chat_id, 0, reply_to_message_id,
-                                                    get_message_send_options(disable_notification, protect_content),
-                                                    std::move(input_message_contents), false),
-              td::make_unique<TdOnSendMessageAlbumCallback>(this, std::move(query)));
+            send_request(
+                make_object<td_api::sendMessageAlbum>(chat_id, message_thread_id, reply_to_message_id,
+                                                      get_message_send_options(disable_notification, protect_content),
+                                                      std::move(input_message_contents), false),
+                td::make_unique<TdOnSendMessageAlbumCallback>(this, chat_id, message_count, std::move(query)));
+          };
+          check_message_thread(chat_id, message_thread_id, reply_to_message_id, std::move(query),
+                               std::move(on_message_thread_checked));
         };
         check_message(chat_id, reply_to_message_id, reply_to_message_id <= 0 || allow_sending_without_reply,
                       AccessRights::Write, "replied message", std::move(query), std::move(on_success));
@@ -7542,7 +7815,7 @@ td::Status Client::process_edit_message_media_query(PromisedQueryPtr &query) {
   auto chat_id = query->arg("chat_id");
   auto message_id = get_message_id(query.get());
   TRY_RESULT(reply_markup, get_reply_markup(query.get()));
-  TRY_RESULT(input_media, get_input_media(query.get(), "media", false));
+  TRY_RESULT(input_media, get_input_media(query.get(), "media"));
 
   if (chat_id.empty() && message_id == 0) {
     TRY_RESULT(inline_message_id, get_inline_message_id(query.get()));
@@ -7650,7 +7923,6 @@ td::Status Client::process_delete_message_query(PromisedQueryPtr &query) {
 
   check_message(chat_id, message_id, false, AccessRights::Write, "message to delete", std::move(query),
                 [this](int64 chat_id, int64 message_id, PromisedQueryPtr query) {
-                  delete_message(chat_id, message_id, false);
                   send_request(make_object<td_api::deleteMessages>(chat_id, td::vector<int64>{message_id}, true),
                                td::make_unique<TdOnOkQueryCallback>(std::move(query)));
                 });
@@ -8038,6 +8310,92 @@ td::Status Client::process_delete_chat_sticker_set_query(PromisedQueryPtr &query
   return Status::OK();
 }
 
+td::Status Client::process_get_forum_topic_icon_stickers_query(PromisedQueryPtr &query) {
+  send_request(make_object<td_api::getForumTopicDefaultIcons>(),
+               td::make_unique<TdOnGetStickersCallback>(this, std::move(query)));
+  return Status::OK();
+}
+
+td::Status Client::process_create_forum_topic_query(PromisedQueryPtr &query) {
+  auto chat_id = query->arg("chat_id");
+  auto name = query->arg("name");
+  int32 icon_color = get_integer_arg(query.get(), "icon_color", 0);
+  auto icon_custom_emoji_id = td::to_integer<int64>(query->arg("icon_custom_emoji_id"));
+
+  check_chat(chat_id, AccessRights::Write, std::move(query),
+             [this, name = name.str(), icon_color, icon_custom_emoji_id](int64 chat_id, PromisedQueryPtr query) {
+               send_request(make_object<td_api::createForumTopic>(
+                                chat_id, name, make_object<td_api::forumTopicIcon>(icon_color, icon_custom_emoji_id)),
+                            td::make_unique<TdOnGetForumTopicInfoCallback>(std::move(query)));
+             });
+  return Status::OK();
+}
+
+td::Status Client::process_edit_forum_topic_query(PromisedQueryPtr &query) {
+  auto chat_id = query->arg("chat_id");
+  auto message_thread_id = get_message_id(query.get(), "message_thread_id");
+  auto name = query->arg("name");
+  auto edit_icon_custom_emoji_id = query->has_arg("icon_custom_emoji_id");
+  auto icon_custom_emoji_id = td::to_integer<int64>(query->arg("icon_custom_emoji_id"));
+
+  check_chat(chat_id, AccessRights::Write, std::move(query),
+             [this, message_thread_id, name = name.str(), edit_icon_custom_emoji_id, icon_custom_emoji_id](
+                 int64 chat_id, PromisedQueryPtr query) {
+               send_request(make_object<td_api::editForumTopic>(chat_id, message_thread_id, name,
+                                                                edit_icon_custom_emoji_id, icon_custom_emoji_id),
+                            td::make_unique<TdOnOkQueryCallback>(std::move(query)));
+             });
+  return Status::OK();
+}
+
+td::Status Client::process_close_forum_topic_query(PromisedQueryPtr &query) {
+  auto chat_id = query->arg("chat_id");
+  auto message_thread_id = get_message_id(query.get(), "message_thread_id");
+
+  check_chat(chat_id, AccessRights::Write, std::move(query),
+             [this, message_thread_id](int64 chat_id, PromisedQueryPtr query) {
+               send_request(make_object<td_api::toggleForumTopicIsClosed>(chat_id, message_thread_id, true),
+                            td::make_unique<TdOnOkQueryCallback>(std::move(query)));
+             });
+  return Status::OK();
+}
+
+td::Status Client::process_reopen_forum_topic_query(PromisedQueryPtr &query) {
+  auto chat_id = query->arg("chat_id");
+  auto message_thread_id = get_message_id(query.get(), "message_thread_id");
+
+  check_chat(chat_id, AccessRights::Write, std::move(query),
+             [this, message_thread_id](int64 chat_id, PromisedQueryPtr query) {
+               send_request(make_object<td_api::toggleForumTopicIsClosed>(chat_id, message_thread_id, false),
+                            td::make_unique<TdOnOkQueryCallback>(std::move(query)));
+             });
+  return Status::OK();
+}
+
+td::Status Client::process_delete_forum_topic_query(PromisedQueryPtr &query) {
+  auto chat_id = query->arg("chat_id");
+  auto message_thread_id = get_message_id(query.get(), "message_thread_id");
+
+  check_chat(chat_id, AccessRights::Write, std::move(query),
+             [this, message_thread_id](int64 chat_id, PromisedQueryPtr query) {
+               send_request(make_object<td_api::deleteForumTopic>(chat_id, message_thread_id),
+                            td::make_unique<TdOnOkQueryCallback>(std::move(query)));
+             });
+  return Status::OK();
+}
+
+td::Status Client::process_unpin_all_forum_topic_messages_query(PromisedQueryPtr &query) {
+  auto chat_id = query->arg("chat_id");
+  auto message_thread_id = get_message_id(query.get(), "message_thread_id");
+
+  check_chat(chat_id, AccessRights::Write, std::move(query),
+             [this, message_thread_id](int64 chat_id, PromisedQueryPtr query) {
+               send_request(make_object<td_api::unpinAllMessageThreadMessages>(chat_id, message_thread_id),
+                            td::make_unique<TdOnOkQueryCallback>(std::move(query)));
+             });
+  return Status::OK();
+}
+
 td::Status Client::process_get_chat_member_query(PromisedQueryPtr &query) {
   auto chat_id = query->arg("chat_id");
   TRY_RESULT(user_id, get_user_id(query.get()));
@@ -8123,15 +8481,17 @@ td::Status Client::process_promote_chat_member_query(PromisedQueryPtr &query) {
   auto can_invite_users = to_bool(query->arg("can_invite_users"));
   auto can_restrict_members = to_bool(query->arg("can_restrict_members"));
   auto can_pin_messages = to_bool(query->arg("can_pin_messages"));
+  auto can_manage_topics = to_bool(query->arg("can_manage_topics"));
   auto can_promote_members = to_bool(query->arg("can_promote_members"));
   auto can_manage_video_chats =
       to_bool(query->arg("can_manage_voice_chats")) || to_bool(query->arg("can_manage_video_chats"));
   auto is_anonymous = to_bool(query->arg("is_anonymous"));
   auto status = make_object<td_api::chatMemberStatusAdministrator>(
       td::string(), true,
-      make_object<td_api::chatAdministratorRights>(
-          can_manage_chat, can_change_info, can_post_messages, can_edit_messages, can_delete_messages, can_invite_users,
-          can_restrict_members, can_pin_messages, can_promote_members, can_manage_video_chats, is_anonymous));
+      make_object<td_api::chatAdministratorRights>(can_manage_chat, can_change_info, can_post_messages,
+                                                   can_edit_messages, can_delete_messages, can_invite_users,
+                                                   can_restrict_members, can_pin_messages, can_manage_topics,
+                                                   can_promote_members, can_manage_video_chats, is_anonymous));
   check_chat(chat_id, AccessRights::Write, std::move(query),
              [this, user_id, status = std::move(status)](int64 chat_id, PromisedQueryPtr query) mutable {
                auto chat_info = get_chat(chat_id);
@@ -8237,6 +8597,7 @@ td::Status Client::process_restrict_chat_member_query(PromisedQueryPtr &query) {
                        permissions->can_change_info_ = old_permissions->can_change_info_;
                        permissions->can_invite_users_ = old_permissions->can_invite_users_;
                        permissions->can_pin_messages_ = old_permissions->can_pin_messages_;
+                       permissions->can_manage_topics_ = old_permissions->can_manage_topics_;
                      }
 
                      send_request(make_object<td_api::setChatMemberStatus>(
@@ -8506,7 +8867,7 @@ td::Status Client::process_answer_custom_query_query(PromisedQueryPtr &query) {
 }
 
 td::Status Client::process_get_updates_query(PromisedQueryPtr &query) {
-  if (!webhook_url_.empty() || webhook_set_query_) {
+  if (!webhook_url_.empty() || webhook_set_query_ || active_webhook_set_query_) {
     fail_query_conflict(
         "Conflict: can't use getUpdates method while webhook is active; use deleteWebhook to delete the webhook first",
         std::move(query));
@@ -8521,6 +8882,9 @@ td::Status Client::process_get_updates_query(PromisedQueryPtr &query) {
   auto now = td::Time::now_cached();
   if (offset == previous_get_updates_offset_ && timeout < 3 && now < previous_get_updates_start_time_ + 3.0) {
     timeout = 3;
+  }
+  if (offset == previous_get_updates_offset_ && now < previous_get_updates_start_time_ + 0.5) {
+    limit = 1;
   }
   previous_get_updates_offset_ = offset;
   previous_get_updates_start_time_ = now;
@@ -8557,6 +8921,9 @@ td::Status Client::process_set_webhook_query(PromisedQueryPtr &query) {
   if (webhook_set_query_) {
     // already updating webhook. Cancel previous request
     fail_query_conflict("Conflict: terminated by other setWebhook", std::move(webhook_set_query_));
+  } else if (active_webhook_set_query_) {
+    query->set_retry_after_error(1);
+    return Status::OK();
   } else if (webhook_url_ == new_url && !has_webhook_certificate_ && !new_has_certificate &&
              new_max_connections == webhook_max_connections_ && new_fix_ip_address == webhook_fix_ip_address_ &&
              new_secret_token == webhook_secret_token_ &&
@@ -8575,7 +8942,7 @@ td::Status Client::process_set_webhook_query(PromisedQueryPtr &query) {
   if (now > next_set_webhook_logging_time_ || webhook_url_ != new_url) {
     next_set_webhook_logging_time_ = now + 300;
     LOG(WARNING) << "Set webhook to " << new_url << ", max_connections = " << new_max_connections
-                 << ", IP address = " << new_ip_address;
+                 << ", IP address = " << new_ip_address << ", drop_pending_updates = " << drop_pending_updates;
   }
 
   if (!new_url.empty()) {
@@ -8591,6 +8958,7 @@ td::Status Client::process_set_webhook_query(PromisedQueryPtr &query) {
 
     // wait for webhook_close callback
     webhook_query_type_ = WebhookQueryType::Cancel;
+    CHECK(!active_webhook_set_query_);
     webhook_set_query_ = std::move(query);
     return Status::OK();
   }
@@ -8765,7 +9133,7 @@ void Client::webhook_error(Status status) {
 
 void Client::webhook_closed(Status status) {
   if (has_webhook_certificate_) {
-    td::Scheduler::instance()->run_on_scheduler(get_database_scheduler_id(),
+    td::Scheduler::instance()->run_on_scheduler(SharedData::get_database_scheduler_id(),
                                                 [actor_id = actor_id(this), path = get_webhook_certificate_path(),
                                                  status = std::move(status)](td::Unit) mutable {
                                                   LOG(INFO) << "Unlink certificate " << path;
@@ -8836,6 +9204,9 @@ bool Client::get_webhook_fix_ip_address(const Query *query) {
 
 void Client::do_set_webhook(PromisedQueryPtr query, bool was_deleted) {
   CHECK(webhook_url_.empty());
+  if (logging_out_ || closing_) {
+    return fail_query_closing(std::move(query));
+  }
   if (to_bool(query->arg("drop_pending_updates"))) {
     clear_tqueue();
   }
@@ -8856,53 +9227,89 @@ void Client::do_set_webhook(PromisedQueryPtr query, bool was_deleted) {
       return fail_query(400, "Bad Request: secret token contains unallowed characters", std::move(query));
     }
 
-    has_webhook_certificate_ = false;
-    auto *cert_file_ptr = get_webhook_certificate(query.get());
-    if (cert_file_ptr != nullptr) {
-      auto size = cert_file_ptr->size;
-      if (size > MAX_CERTIFICATE_FILE_SIZE) {
-        return fail_query(400, PSLICE() << "Bad Request: certificate size is too big (" << size << " bytes)",
-                          std::move(query));
-      }
-      auto from_path = cert_file_ptr->temp_file_name;
-      auto to_path = get_webhook_certificate_path();
-      auto status = td::copy_file(from_path, to_path, size);
-      if (status.is_error()) {
-        return fail_query(500, "Internal Server Error: failed to save certificate", std::move(query));
-      }
-      has_webhook_certificate_ = true;
-    } else if (query->is_internal() && query->arg("certificate") == "previous") {
-      has_webhook_certificate_ = true;
+    if (active_webhook_set_query_) {
+      // shouldn't happen, unless the active setWebhook request took more than 1 second
+      return query->set_retry_after_error(1);
     }
 
-    webhook_url_ = new_url.str();
-    webhook_set_time_ = td::Time::now();
-    webhook_max_connections_ = get_webhook_max_connections(query.get());
-    webhook_secret_token_ = secret_token.str();
-    webhook_ip_address_ = query->arg("ip_address").str();
-    webhook_fix_ip_address_ = get_webhook_fix_ip_address(query.get());
-    last_webhook_error_date_ = 0;
-    last_webhook_error_ = Status::OK();
-
-    update_allowed_update_types(query.get());
-
-    LOG(WARNING) << "Create " << (has_webhook_certificate_ ? "" : "not ") << "self signed webhook: " << url.ok();
-    auto webhook_actor_name = PSTRING() << "Webhook " << url.ok();
-    webhook_id_ = td::create_actor<WebhookActor>(
-        webhook_actor_name, actor_shared(this, webhook_generation_), tqueue_id_, url.move_as_ok(),
-        has_webhook_certificate_ ? get_webhook_certificate_path() : "", webhook_max_connections_, query->is_internal(),
-        webhook_ip_address_, webhook_fix_ip_address_, webhook_secret_token_, parameters_);
-    // wait for webhook verified or webhook callback
-    webhook_query_type_ = WebhookQueryType::Verify;
-    webhook_set_query_ = std::move(query);
+    CHECK(!has_webhook_certificate_);
+    if (query->is_internal()) {
+      has_webhook_certificate_ = query->arg("certificate") == "previous";
+    } else {
+      auto *cert_file_ptr = get_webhook_certificate(query.get());
+      if (cert_file_ptr != nullptr) {
+        auto size = cert_file_ptr->size;
+        if (size > MAX_CERTIFICATE_FILE_SIZE) {
+          return fail_query(400, PSLICE() << "Bad Request: certificate size is too big (" << size << " bytes)",
+                            std::move(query));
+        }
+        CHECK(!webhook_set_query_);
+        active_webhook_set_query_ = std::move(query);
+        td::Scheduler::instance()->run_on_scheduler(
+            SharedData::get_database_scheduler_id(),
+            [actor_id = actor_id(this), from_path = cert_file_ptr->temp_file_name,
+             to_path = get_webhook_certificate_path(), size](td::Unit) mutable {
+              LOG(INFO) << "Copy certificate to " << to_path;
+              auto status = td::copy_file(from_path, to_path, size);
+              send_closure(actor_id, &Client::on_webhook_certificate_copied, std::move(status));
+            });
+        return;
+      }
+    }
+    finish_set_webhook(std::move(query));
   } else {
     answer_query(td::JsonTrue(), std::move(query),
                  was_deleted ? Slice("Webhook was deleted") : Slice("Webhook is already deleted"));
   }
 }
 
+void Client::on_webhook_certificate_copied(Status status) {
+  CHECK(active_webhook_set_query_);
+  if (status.is_error()) {
+    return fail_query(500, "Internal Server Error: failed to save certificate", std::move(active_webhook_set_query_));
+  }
+  has_webhook_certificate_ = true;
+  finish_set_webhook(std::move(active_webhook_set_query_));
+}
+
+void Client::finish_set_webhook(PromisedQueryPtr query) {
+  CHECK(!active_webhook_set_query_);
+  CHECK(!webhook_set_query_);
+  CHECK(webhook_url_.empty());
+  if (logging_out_ || closing_) {
+    return fail_query_closing(std::move(query));
+  }
+  Slice new_url = query->arg("url");
+  CHECK(!new_url.empty());
+  webhook_url_ = new_url.str();
+  webhook_set_time_ = td::Time::now();
+  webhook_max_connections_ = get_webhook_max_connections(query.get());
+  webhook_secret_token_ = query->arg("secret_token").str();
+  webhook_ip_address_ = query->arg("ip_address").str();
+  webhook_fix_ip_address_ = get_webhook_fix_ip_address(query.get());
+  last_webhook_error_date_ = 0;
+  last_webhook_error_ = Status::OK();
+
+  update_allowed_update_types(query.get());
+
+  auto url = td::parse_url(new_url, td::HttpUrl::Protocol::Https);
+  CHECK(url.is_ok());
+
+  LOG(WARNING) << "Create " << (has_webhook_certificate_ ? "self-signed " : "") << "webhook: " << new_url;
+  auto webhook_actor_name = PSTRING() << "Webhook " << url.ok();
+  webhook_id_ = td::create_actor<WebhookActor>(
+      webhook_actor_name, actor_shared(this, webhook_generation_), tqueue_id_, url.move_as_ok(),
+      has_webhook_certificate_ ? get_webhook_certificate_path() : td::string(), webhook_max_connections_,
+      query->is_internal(), webhook_ip_address_, webhook_fix_ip_address_, webhook_secret_token_, parameters_);
+  // wait for webhook verified or webhook callback
+  webhook_query_type_ = WebhookQueryType::Verify;
+  CHECK(!active_webhook_set_query_);
+  webhook_set_query_ = std::move(query);
+}
+
 void Client::do_send_message(object_ptr<td_api::InputMessageContent> input_message_content, PromisedQueryPtr query) {
   auto chat_id = query->arg("chat_id");
+  auto message_thread_id = get_message_id(query.get(), "message_thread_id");
   auto reply_to_message_id = get_message_id(query.get(), "reply_to_message_id");
   auto allow_sending_without_reply = to_bool(query->arg("allow_sending_without_reply"));
   auto disable_notification = to_bool(query->arg("disable_notification"));
@@ -8915,22 +9322,32 @@ void Client::do_send_message(object_ptr<td_api::InputMessageContent> input_messa
 
   resolve_reply_markup_bot_usernames(
       std::move(reply_markup), std::move(query),
-      [this, chat_id = chat_id.str(), reply_to_message_id, allow_sending_without_reply, disable_notification,
-       protect_content, input_message_content = std::move(input_message_content)](
+      [this, chat_id = chat_id.str(), message_thread_id, reply_to_message_id, allow_sending_without_reply,
+       disable_notification, protect_content, input_message_content = std::move(input_message_content)](
           object_ptr<td_api::ReplyMarkup> reply_markup, PromisedQueryPtr query) mutable {
-        auto on_success = [this, disable_notification, protect_content,
+        auto on_success = [this, message_thread_id, disable_notification, protect_content,
                            input_message_content = std::move(input_message_content),
                            reply_markup = std::move(reply_markup)](int64 chat_id, int64 reply_to_message_id,
                                                                    PromisedQueryPtr query) mutable {
-          auto it = yet_unsent_message_count_.find(chat_id);
-          if (it != yet_unsent_message_count_.end() && it->second > MAX_CONCURRENTLY_SENT_CHAT_MESSAGES) {
-            return query->set_retry_after_error(60);
-          }
+          auto on_message_thread_checked =
+              [this, disable_notification, protect_content, input_message_content = std::move(input_message_content),
+               reply_markup = std::move(reply_markup)](int64 chat_id, int64 message_thread_id,
+                                                       int64 reply_to_message_id, PromisedQueryPtr query) mutable {
+                auto &count = yet_unsent_message_count_[chat_id];
+                if (count >= MAX_CONCURRENTLY_SENT_CHAT_MESSAGES) {
+                  flood_limited_query_count_++;
+                  return query->set_retry_after_error(60);
+                }
+                count++;
 
-          send_request(make_object<td_api::sendMessage>(chat_id, 0, reply_to_message_id,
-                                                        get_message_send_options(disable_notification, protect_content),
-                                                        std::move(reply_markup), std::move(input_message_content)),
-                       td::make_unique<TdOnSendMessageCallback>(this, std::move(query)));
+                send_request(
+                    make_object<td_api::sendMessage>(chat_id, message_thread_id, reply_to_message_id,
+                                                     get_message_send_options(disable_notification, protect_content),
+                                                     std::move(reply_markup), std::move(input_message_content)),
+                    td::make_unique<TdOnSendMessageCallback>(this, chat_id, std::move(query)));
+              };
+          check_message_thread(chat_id, message_thread_id, reply_to_message_id, std::move(query),
+                               std::move(on_message_thread_checked));
         };
         check_message(chat_id, reply_to_message_id, reply_to_message_id <= 0 || allow_sending_without_reply,
                       AccessRights::Write, "replied message", std::move(query), std::move(on_success));
@@ -8964,7 +9381,6 @@ void Client::on_sent_message(object_ptr<td_api::message> &&message, int64 query_
   yet_unsent_message.send_message_query_id = query_id;
   auto emplace_result = yet_unsent_messages_.emplace(yet_unsent_message_id, yet_unsent_message);
   CHECK(emplace_result.second);
-  yet_unsent_message_count_[chat_id]++;
 
   auto &query = *pending_send_message_queries_[query_id];
   query.awaited_message_count++;
@@ -8999,6 +9415,45 @@ void Client::fail_query_conflict(Slice message, PromisedQueryPtr &&query) {
   }
 }
 
+void Client::fail_query_closing(PromisedQueryPtr &&query) {
+  auto error = get_closing_error();
+  if (error.retry_after > 0) {
+    query->set_retry_after_error(error.retry_after);
+  } else {
+    fail_query(error.code, error.message, std::move(query));
+  }
+}
+
+Client::ClosingError Client::get_closing_error() {
+  ClosingError result;
+  result.retry_after = 0;
+  if (logging_out_) {
+    if (is_api_id_invalid_) {
+      result.code = 401;
+      result.message = Slice("Unauthorized: invalid api-id/api-hash");
+    } else if (next_authorization_time_ > 0.0) {
+      result.code = 429;
+      result.retry_after = td::max(static_cast<int>(next_authorization_time_ - td::Time::now()), 0) + 1;
+      if (result.retry_after != prev_retry_after) {
+        prev_retry_after = result.retry_after;
+        retry_after_error_message = PSTRING() << "Too Many Requests: retry after " << result.retry_after;
+      }
+      result.message = retry_after_error_message;
+    } else if (clear_tqueue_) {
+      result.code = 400;
+      result.message = Slice("Logged out");
+    } else {
+      result.code = 401;
+      result.message = Slice("Unauthorized");
+    }
+  } else {
+    CHECK(closing_);
+    result.code = 500;
+    result.message = Slice("Internal Server Error: restart");
+  }
+  return result;
+}
+
 class Client::JsonUpdates final : public Jsonable {
  public:
   explicit JsonUpdates(td::Span<td::TQueue::Event> updates) : updates_(updates) {
@@ -9024,17 +9479,11 @@ void Client::do_get_updates(int32 offset, int32 limit, int32 timeout, PromisedQu
   LOG(DEBUG) << "Get updates with offset = " << offset << ", limit = " << limit << " and timeout = " << timeout;
   LOG(DEBUG) << "Queue head = " << tqueue->get_head(tqueue_id_) << ", queue tail = " << tqueue->get_tail(tqueue_id_);
 
+  if (offset < 0) {
+    tqueue->clear(tqueue_id_, -offset);
+  }
   if (offset <= 0) {
-    auto head = tqueue->get_head(tqueue_id_);
-    if (!head.empty() && offset < 0) {
-      // negative offset is counted from the end
-      auto tail = tqueue->get_tail(tqueue_id_);
-      CHECK(!tail.empty());
-      offset += tail.value();
-    }
-    if (offset < head.value()) {
-      offset = head.value();
-    }
+    offset = tqueue->get_head(tqueue_id_).value();
   }
 
   td::MutableSpan<td::TQueue::Event> updates(parameters_->shared_data_->event_buffer_,
@@ -9137,8 +9586,15 @@ void Client::long_poll_wakeup(bool force_flag) {
 void Client::add_user(UserInfo *user_info, object_ptr<td_api::user> &&user) {
   user_info->first_name = std::move(user->first_name_);
   user_info->last_name = std::move(user->last_name_);
-  user_info->username = std::move(user->username_);
+  if (user->usernames_ == nullptr) {
+    user_info->active_usernames.clear();
+    user_info->editable_username.clear();
+  } else {
+    user_info->active_usernames = std::move(user->usernames_->active_usernames_);
+    user_info->editable_username = std::move(user->usernames_->editable_username_);
+  }
   user_info->language_code = std::move(user->language_code_);
+  user_info->emoji_status_custom_emoji_id = user->emoji_status_ != nullptr ? user->emoji_status_->custom_emoji_id_ : 0;
 
   user_info->have_access = user->have_access_;
   user_info->is_premium = user->is_premium_;
@@ -9169,19 +9625,15 @@ void Client::add_user(UserInfo *user_info, object_ptr<td_api::user> &&user) {
 }
 
 Client::UserInfo *Client::add_user_info(int64 user_id) {
-  auto emplace_result = users_.emplace(user_id, nullptr);
-  auto &user_info = emplace_result.first->second;
-  if (emplace_result.second) {
+  auto &user_info = users_[user_id];
+  if (user_info == nullptr) {
     user_info = td::make_unique<UserInfo>();
-  } else {
-    CHECK(user_info != nullptr);
   }
   return user_info.get();
 }
 
 const Client::UserInfo *Client::get_user_info(int64 user_id) const {
-  auto it = users_.find(user_id);
-  return it == users_.end() ? nullptr : it->second.get();
+  return users_.get_pointer(user_id);
 }
 
 void Client::set_user_photo(int64 user_id, object_ptr<td_api::chatPhoto> &&photo) {
@@ -9213,19 +9665,15 @@ void Client::add_group(GroupInfo *group_info, object_ptr<td_api::basicGroup> &&g
 }
 
 Client::GroupInfo *Client::add_group_info(int64 group_id) {
-  auto emplace_result = groups_.emplace(group_id, nullptr);
-  auto &group_info = emplace_result.first->second;
-  if (emplace_result.second) {
+  auto &group_info = groups_[group_id];
+  if (group_info == nullptr) {
     group_info = td::make_unique<GroupInfo>();
-  } else {
-    CHECK(group_info != nullptr);
   }
   return group_info.get();
 }
 
 const Client::GroupInfo *Client::get_group_info(int64 group_id) const {
-  auto it = groups_.find(group_id);
-  return it == groups_.end() ? nullptr : it->second.get();
+  return groups_.get_pointer(group_id);
 }
 
 void Client::set_group_photo(int64 group_id, object_ptr<td_api::chatPhoto> &&photo) {
@@ -9241,10 +9689,17 @@ void Client::set_group_invite_link(int64 group_id, td::string &&invite_link) {
 }
 
 void Client::add_supergroup(SupergroupInfo *supergroup_info, object_ptr<td_api::supergroup> &&supergroup) {
-  supergroup_info->username = std::move(supergroup->username_);
+  if (supergroup->usernames_ == nullptr) {
+    supergroup_info->active_usernames.clear();
+    supergroup_info->editable_username.clear();
+  } else {
+    supergroup_info->active_usernames = std::move(supergroup->usernames_->active_usernames_);
+    supergroup_info->editable_username = std::move(supergroup->usernames_->editable_username_);
+  }
   supergroup_info->date = supergroup->date_;
   supergroup_info->status = std::move(supergroup->status_);
   supergroup_info->is_supergroup = !supergroup->is_channel_;
+  supergroup_info->is_forum = supergroup->is_forum_;
   supergroup_info->has_location = supergroup->has_location_;
   supergroup_info->join_to_send_messages = supergroup->join_to_send_messages_;
   supergroup_info->join_by_request = supergroup->join_by_request_;
@@ -9283,39 +9738,27 @@ void Client::set_supergroup_location(int64 supergroup_id, object_ptr<td_api::cha
 }
 
 Client::SupergroupInfo *Client::add_supergroup_info(int64 supergroup_id) {
-  auto emplace_result = supergroups_.emplace(supergroup_id, nullptr);
-  auto &supergroup_info = emplace_result.first->second;
-  if (emplace_result.second) {
+  auto &supergroup_info = supergroups_[supergroup_id];
+  if (supergroup_info == nullptr) {
     supergroup_info = td::make_unique<SupergroupInfo>();
-  } else {
-    CHECK(supergroup_info != nullptr);
   }
   return supergroup_info.get();
 }
 
 const Client::SupergroupInfo *Client::get_supergroup_info(int64 supergroup_id) const {
-  auto it = supergroups_.find(supergroup_id);
-  return it == supergroups_.end() ? nullptr : it->second.get();
+  return supergroups_.get_pointer(supergroup_id);
 }
 
 Client::ChatInfo *Client::add_chat(int64 chat_id) {
-  LOG(DEBUG) << "Update chat " << chat_id;
-  auto emplace_result = chats_.emplace(chat_id, nullptr);
-  auto &chat_info = emplace_result.first->second;
-  if (emplace_result.second) {
+  auto &chat_info = chats_[chat_id];
+  if (chat_info == nullptr) {
     chat_info = td::make_unique<ChatInfo>();
-  } else {
-    CHECK(chat_info != nullptr);
   }
   return chat_info.get();
 }
 
 const Client::ChatInfo *Client::get_chat(int64 chat_id) const {
-  auto it = chats_.find(chat_id);
-  if (it == chats_.end()) {
-    return nullptr;
-  }
-  return it->second.get();
+  return chats_.get_pointer(chat_id);
 }
 
 Client::ChatType Client::get_chat_type(int64 chat_id) const {
@@ -9373,7 +9816,7 @@ td::string Client::get_chat_description(int64 chat_id) const {
       }
       return PSTRING() << (supergroup_info->is_supergroup ? "supergroup" : "channel") << " chat " << chat_id
                        << ", chat status = " << to_string(supergroup_info->status)
-                       << ", username = " << supergroup_info->username;
+                       << ", usernames = " << supergroup_info->active_usernames;
     }
     case ChatInfo::Type::Unknown:
       return PSTRING() << "unknown chat " << chat_id;
@@ -9459,6 +9902,9 @@ void Client::json_store_administrator_rights(td::JsonObjectScope &object, const 
   if (chat_type == ChatType::Group || chat_type == ChatType::Supergroup) {
     object("can_pin_messages", td::JsonBool(rights->can_pin_messages_));
   }
+  if (chat_type == ChatType::Supergroup) {
+    object("can_manage_topics", td::JsonBool(rights->can_manage_topics_));
+  }
   object("can_promote_members", td::JsonBool(rights->can_promote_members_));
   object("can_manage_video_chats", td::JsonBool(rights->can_manage_video_chats_));
   object("is_anonymous", td::JsonBool(rights->is_anonymous_));
@@ -9473,6 +9919,7 @@ void Client::json_store_permissions(td::JsonObjectScope &object, const td_api::c
   object("can_change_info", td::JsonBool(permissions->can_change_info_));
   object("can_invite_users", td::JsonBool(permissions->can_invite_users_));
   object("can_pin_messages", td::JsonBool(permissions->can_pin_messages_));
+  object("can_manage_topics", td::JsonBool(permissions->can_manage_topics_));
 }
 
 Client::Slice Client::get_update_type_name(UpdateType update_type) {
@@ -9641,7 +10088,7 @@ void Client::add_new_message(object_ptr<td_api::message> &&message, bool is_edit
   auto chat_id = message->chat_id_;
   CHECK(chat_id != 0);
   new_message_queues_[chat_id].queue_.emplace(std::move(message), is_edited);
-  process_new_message_queue(chat_id);
+  process_new_message_queue(chat_id, 0);
 }
 
 void Client::add_update_poll(object_ptr<td_api::updatePoll> &&update) {
@@ -9682,9 +10129,13 @@ void Client::process_new_callback_query_queue(int64 user_id, int state) {
   auto &queue = new_callback_query_queues_[user_id];
   if (queue.has_active_request_) {
     CHECK(state == 0);
+    CHECK(!queue.queue_.empty());
+    LOG(INFO) << "Have an active request in callback query queue of size " << queue.queue_.size() << " for user "
+              << user_id;
     return;
   }
   if (logging_out_ || closing_) {
+    LOG(INFO) << "Ignore callback query while closing for user " << user_id;
     new_callback_query_queues_.erase(user_id);
     return;
   }
@@ -9692,8 +10143,10 @@ void Client::process_new_callback_query_queue(int64 user_id, int state) {
     auto &query = queue.queue_.front();
     int64 chat_id = query->chat_id_;
     int64 message_id = query->message_id_;
-    auto message_info = get_message(chat_id, message_id);
+    auto message_info = get_message(chat_id, message_id, state > 0);
     // callback message can be already deleted in the bot outbox
+    LOG(INFO) << "Process callback query from user " << user_id << " in message " << message_id << " in chat "
+              << chat_id << " with state " << state;
     if (state == 0) {
       if (message_info == nullptr) {
         // get the message from the server
@@ -9706,7 +10159,7 @@ void Client::process_new_callback_query_queue(int64 user_id, int state) {
     if (state == 1) {
       auto reply_to_message_id =
           message_info == nullptr || message_info->is_reply_to_message_deleted ? 0 : message_info->reply_to_message_id;
-      if (reply_to_message_id > 0 && get_message(chat_id, reply_to_message_id) == nullptr) {
+      if (reply_to_message_id > 0 && get_message(chat_id, reply_to_message_id, false) == nullptr) {
         queue.has_active_request_ = true;
         return send_request(make_object<td_api::getRepliedMessage>(chat_id, message_id),
                             td::make_unique<TdOnGetCallbackQueryMessageCallback>(this, user_id, state));
@@ -9723,7 +10176,7 @@ void Client::process_new_callback_query_queue(int64 user_id, int state) {
       auto reply_to_message_id =
           message_info == nullptr || message_info->is_reply_to_message_deleted ? 0 : message_info->reply_to_message_id;
       if (reply_to_message_id > 0) {
-        auto reply_to_message_info = get_message(chat_id, reply_to_message_id);
+        auto reply_to_message_info = get_message(chat_id, reply_to_message_id, true);
         auto reply_sticker_set_id =
             reply_to_message_info == nullptr ? 0 : get_sticker_set_id(reply_to_message_info->content);
         if (!have_sticker_set_name(reply_sticker_set_id)) {
@@ -9833,6 +10286,10 @@ bool Client::need_skip_update_message(int64 chat_id, const object_ptr<td_api::me
       case td_api::messageVideoChatStarted::ID:
       case td_api::messageVideoChatEnded::ID:
       case td_api::messageInviteVideoChatParticipants::ID:
+      case td_api::messageForumTopicCreated::ID:
+      case td_api::messageForumTopicEdited::ID:
+      case td_api::messageForumTopicIsClosedToggled::ID:
+      case td_api::messageForumTopicIsHiddenToggled::ID:
         // don't skip
         break;
       default:
@@ -9895,7 +10352,7 @@ bool Client::need_skip_update_message(int64 chat_id, const object_ptr<td_api::me
       if (pinned_message_id <= 0) {
         return true;
       }
-      const MessageInfo *pinned_message = get_message(chat_id, pinned_message_id);
+      const MessageInfo *pinned_message = get_message(chat_id, pinned_message_id, true);
       if (pinned_message == nullptr) {
         LOG(WARNING) << "Pinned unknown, inaccessible or deleted message " << pinned_message_id << " in " << chat_id;
         return true;
@@ -9931,12 +10388,14 @@ bool Client::need_skip_update_message(int64 chat_id, const object_ptr<td_api::me
       return true;
     case td_api::messageGiftedPremium::ID:
       return true;
+    case td_api::messageForumTopicEdited::ID:
+      return true;
     default:
       break;
   }
 
   if (is_edited) {
-    const MessageInfo *old_message = get_message(chat_id, message->id_);
+    const MessageInfo *old_message = get_message(chat_id, message->id_, true);
     if (old_message != nullptr && !old_message->is_content_changed) {
       return true;
     }
@@ -10126,15 +10585,11 @@ bool Client::have_sticker_set_name(int64 sticker_set_id) const {
   return sticker_set_id == 0 || sticker_set_names_.count(sticker_set_id) > 0;
 }
 
-Client::Slice Client::get_sticker_set_name(int64 sticker_set_id) const {
-  auto it = sticker_set_names_.find(sticker_set_id);
-  if (it == sticker_set_names_.end()) {
-    return Slice();
-  }
-  return it->second;
+td::string Client::get_sticker_set_name(int64 sticker_set_id) const {
+  return sticker_set_names_.get(sticker_set_id);
 }
 
-void Client::process_new_message_queue(int64 chat_id) {
+void Client::process_new_message_queue(int64 chat_id, int state) {
   auto &queue = new_message_queues_[chat_id];
   if (queue.has_active_request_) {
     return;
@@ -10148,7 +10603,7 @@ void Client::process_new_message_queue(int64 chat_id) {
     CHECK(chat_id == message_ref->chat_id_);
     int64 message_id = message_ref->id_;
     int64 reply_to_message_id = get_reply_to_message_id(message_ref);
-    if (reply_to_message_id > 0 && get_message(chat_id, reply_to_message_id) == nullptr) {
+    if (reply_to_message_id > 0 && get_message(chat_id, reply_to_message_id, state > 0) == nullptr) {
       queue.has_active_request_ = true;
       return send_request(make_object<td_api::getRepliedMessage>(chat_id, message_id),
                           td::make_unique<TdOnGetReplyMessageCallback>(this, chat_id));
@@ -10160,7 +10615,7 @@ void Client::process_new_message_queue(int64 chat_id) {
                           td::make_unique<TdOnGetStickerSetCallback>(this, message_sticker_set_id, 0, chat_id));
     }
     if (reply_to_message_id > 0) {
-      auto reply_to_message_info = get_message(chat_id, reply_to_message_id);
+      auto reply_to_message_info = get_message(chat_id, reply_to_message_id, true);
       CHECK(reply_to_message_info != nullptr);
       auto reply_sticker_set_id = get_sticker_set_id(reply_to_message_info->content);
       if (!have_sticker_set_name(reply_sticker_set_id)) {
@@ -10191,16 +10646,40 @@ void Client::process_new_message_queue(int64 chat_id) {
     }
 
     int32 message_date = message->edit_date_ == 0 ? message->date_ : message->edit_date_;
+    if (delayed_update_count_ > 0 && (update_type != delayed_update_type_ || chat_id != delayed_chat_id_)) {
+      if (delayed_update_count_ == 1) {
+        LOG(ERROR) << "Receive very old update " << get_update_type_name(delayed_update_type_) << " sent at "
+                   << delayed_min_date_ << " in chat " << delayed_chat_id_ << " with a delay of " << delayed_max_time_
+                   << " seconds";
+      } else {
+        LOG(ERROR) << "Receive " << delayed_update_count_ << " very old updates "
+                   << get_update_type_name(delayed_update_type_) << " sent from " << delayed_min_date_ << " to "
+                   << delayed_max_date_ << " in chat " << delayed_chat_id_ << " with a delay up to "
+                   << delayed_max_time_ << " seconds";
+      }
+      delayed_update_count_ = 0;
+    }
     auto now = get_unix_time();
     auto update_delay_time = now - td::max(message_date, parameters_->shared_data_->get_unix_time(webhook_set_time_));
     const auto UPDATE_DELAY_WARNING_TIME = 10 * 60;
-    LOG_IF(ERROR, update_delay_time > UPDATE_DELAY_WARNING_TIME)
-        << "Receive very old update " << get_update_type_name(update_type) << " sent at " << message_date << " to chat "
-        << chat_id << " with a delay of " << update_delay_time << " seconds: " << to_string(message);
+    if (update_delay_time > UPDATE_DELAY_WARNING_TIME && message_date > last_synchronization_error_date_ + 60) {
+      if (delayed_update_count_ == 0) {
+        delayed_update_type_ = update_type;
+        delayed_chat_id_ = chat_id;
+        delayed_min_date_ = message_date;
+        delayed_max_date_ = message_date;
+        delayed_max_time_ = update_delay_time;
+      } else {
+        delayed_min_date_ = td::min(message_date, delayed_min_date_);
+        delayed_max_date_ = td::max(message_date, delayed_max_date_);
+        delayed_max_time_ = td::max(update_delay_time, delayed_max_time_);
+      }
+      delayed_update_count_++;
+    }
     auto left_time = message_date + 86400 - now;
     add_message(std::move(message));
 
-    auto message_info = get_message(chat_id, message_id);
+    auto message_info = get_message(chat_id, message_id, true);
     CHECK(message_info != nullptr);
 
     message_info->is_content_changed = false;
@@ -10238,11 +10717,11 @@ void Client::remove_replies_to_message(int64 chat_id, int64 reply_to_message_id,
   reply_message_ids_.erase(it);
 }
 
-void Client::delete_message(int64 chat_id, int64 message_id, bool only_from_cache) {
+td::unique_ptr<Client::MessageInfo> Client::delete_message(int64 chat_id, int64 message_id, bool only_from_cache) {
   remove_replies_to_message(chat_id, message_id, only_from_cache);
 
-  auto it = messages_.find({chat_id, message_id});
-  if (it == messages_.end()) {
+  auto message_info = std::move(messages_[{chat_id, message_id}]);
+  if (message_info == nullptr) {
     if (yet_unsent_messages_.count({chat_id, message_id}) > 0) {
       // yet unsent message is deleted, possible only if we are trying to write to inaccessible supergroup or
       // sent message was deleted before added to the chat
@@ -10266,14 +10745,11 @@ void Client::delete_message(int64 chat_id, int64 message_id, bool only_from_cach
 
       on_message_send_failed(chat_id, message_id, 0, std::move(error));
     }
-    return;
+  } else {
+    set_message_reply_to_message_id(message_info.get(), 0);
+    messages_.erase({chat_id, message_id});
   }
-
-  auto message_info = it->second.get();
-
-  set_message_reply_to_message_id(message_info, 0);
-
-  messages_.erase(it);
+  return message_info;
 }
 
 Client::FullMessageId Client::add_message(object_ptr<td_api::message> &&message, bool force_update_content) {
@@ -10284,16 +10760,14 @@ Client::FullMessageId Client::add_message(object_ptr<td_api::message> &&message,
   int64 message_id = message->id_;
 
   LOG(DEBUG) << "Add message " << message_id << " to chat " << chat_id;
-  td::unique_ptr<MessageInfo> message_info;
-  auto it = messages_.find({chat_id, message_id});
-  if (it == messages_.end()) {
+  auto &message_info = messages_[{chat_id, message_id}];
+  if (message_info == nullptr) {
     message_info = td::make_unique<MessageInfo>();
-  } else {
-    message_info = std::move(it->second);
   }
 
   message_info->id = message_id;
   message_info->chat_id = chat_id;
+  message_info->message_thread_id = message->message_thread_id_;
   message_info->date = message->date_;
   message_info->edit_date = message->edit_date_;
   message_info->media_album_id = message->media_album_id_;
@@ -10377,6 +10851,7 @@ Client::FullMessageId Client::add_message(object_ptr<td_api::message> &&message,
   }
 
   message_info->can_be_saved = message->can_be_saved_;
+  message_info->is_topic_message = message->is_topic_message_;
   message_info->author_signature = std::move(message->author_signature_);
 
   if (message->reply_in_chat_id_ != chat_id && message->reply_to_message_id_ != 0) {
@@ -10395,10 +10870,11 @@ Client::FullMessageId Client::add_message(object_ptr<td_api::message> &&message,
       send_request(make_object<td_api::getStickerSet>(sticker_set_id),
                    td::make_unique<TdOnGetStickerSetCallback>(this, sticker_set_id, 0, 0));
     }
+  } else if (message->content_->get_id() == td_api::messagePoll::ID) {
+    message_info->content = std::move(message->content_);
   }
   set_message_reply_markup(message_info.get(), std::move(message->reply_markup_));
 
-  messages_[{chat_id, message_id}] = std::move(message_info);
   message = nullptr;
 
   return {chat_id, message_id};
@@ -10425,26 +10901,30 @@ void Client::on_update_message_edited(int64 chat_id, int64 message_id, int32 edi
   set_message_reply_markup(message_info, std::move(reply_markup));
 }
 
-const Client::MessageInfo *Client::get_message(int64 chat_id, int64 message_id) const {
-  auto it = messages_.find({chat_id, message_id});
-  if (it == messages_.end()) {
+const Client::MessageInfo *Client::get_message(int64 chat_id, int64 message_id, bool force_cache) const {
+  auto message_info = messages_.get_pointer({chat_id, message_id});
+  if (message_info == nullptr) {
     LOG(DEBUG) << "Not found message " << message_id << " from chat " << chat_id;
     return nullptr;
   }
-  LOG(DEBUG) << "Found message " << message_id << " from chat " << chat_id;
+  if (!force_cache && message_info->content->get_id() == td_api::messagePoll::ID) {
+    LOG(DEBUG) << "Ignore found message " << message_id << " from chat " << chat_id;
+    return nullptr;
+  }
 
-  return it->second.get();
+  LOG(DEBUG) << "Found message " << message_id << " from chat " << chat_id;
+  return message_info;
 }
 
 Client::MessageInfo *Client::get_message_editable(int64 chat_id, int64 message_id) {
-  auto it = messages_.find({chat_id, message_id});
-  if (it == messages_.end()) {
+  auto message_info = messages_.get_pointer({chat_id, message_id});
+  if (message_info == nullptr) {
     LOG(DEBUG) << "Not found message " << message_id << " from chat " << chat_id;
     return nullptr;
   }
   LOG(DEBUG) << "Found message " << message_id << " from chat " << chat_id;
 
-  return it->second.get();
+  return message_info;
 }
 
 td::string Client::get_chat_member_status(const object_ptr<td_api::ChatMemberStatus> &status) {
@@ -10561,7 +11041,7 @@ td::int32 Client::as_client_message_id(int64 message_id) {
 }
 
 td::int64 Client::get_supergroup_chat_id(int64 supergroup_id) {
-  return static_cast<td::int64>(-1000000000000ll) - supergroup_id;
+  return static_cast<int64>(-1000000000000ll) - supergroup_id;
 }
 
 td::int64 Client::get_basic_group_chat_id(int64 basic_group_id) {
@@ -10572,13 +11052,6 @@ constexpr Client::int64 Client::GREAT_MINDS_SET_ID;
 constexpr Client::Slice Client::GREAT_MINDS_SET_NAME;
 
 constexpr Client::Slice Client::MASK_POINTS[MASK_POINTS_SIZE];
-
-constexpr int Client::LOGGING_OUT_ERROR_CODE;
-constexpr Client::Slice Client::LOGGING_OUT_ERROR_DESCRIPTION;
-constexpr Client::Slice Client::API_ID_INVALID_ERROR_DESCRIPTION;
-
-constexpr int Client::CLOSING_ERROR_CODE;
-constexpr Client::Slice Client::CLOSING_ERROR_DESCRIPTION;
 
 td::FlatHashMap<td::string, td::Status (Client::*)(PromisedQueryPtr &query)> Client::methods_;
 

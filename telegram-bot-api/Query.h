@@ -23,6 +23,7 @@
 #include "td/utils/StringBuilder.h"
 
 #include <algorithm>
+#include <atomic>
 #include <memory>
 #include <utility>
 
@@ -109,9 +110,9 @@ class Query final : public td::ListNode {
   Query &operator=(Query &&) = delete;
   ~Query() {
     if (shared_data_) {
-      shared_data_->query_count_--;
+      shared_data_->query_count_.fetch_sub(1, std::memory_order_relaxed);
       if (!empty()) {
-        shared_data_->query_list_size_--;
+        shared_data_->query_list_size_.fetch_sub(1, std::memory_order_relaxed);
       }
     }
   }

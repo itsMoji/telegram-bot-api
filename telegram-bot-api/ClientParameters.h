@@ -29,10 +29,10 @@ namespace telegram_bot_api {
 
 struct SharedData {
   std::atomic<td::uint64> query_count_{0};
+  std::atomic<size_t> query_list_size_{0};
   std::atomic<int> next_verbosity_level_{-1};
 
-  // not thread-safe
-  size_t query_list_size_ = 0;
+  // not thread-safe, must be used from a single thread
   td::ListNode query_list_;
   td::unique_ptr<td::KeyValueSyncInterface> webhook_db_;
   td::unique_ptr<td::TQueue> tqueue_;
@@ -51,6 +51,16 @@ struct SharedData {
       return std::numeric_limits<td::int32>::max();
     }
     return static_cast<td::int32>(result);
+  }
+
+  static td::int32 get_database_scheduler_id() {
+    // the same scheduler as for database in Td
+    return 1;
+  }
+
+  static td::int32 get_file_gc_scheduler_id() {
+    // the same scheduler as for file GC in Td
+    return 2;
   }
 };
 
