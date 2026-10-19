@@ -249,6 +249,10 @@ class PromiseDeleter {
     CHECK(!promise_);
   }
 
+  td::Promise<td::unique_ptr<Query>> release_promise() {
+    return std::move(promise_);
+  }
+
  private:
   td::Promise<td::unique_ptr<Query>> promise_;
 };

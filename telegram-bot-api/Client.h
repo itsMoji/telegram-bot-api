@@ -118,6 +118,7 @@ class Client final : public WebhookActor::Callback {
   class JsonAudios;
   class JsonDocument;
   class JsonFileDownloadStatus;
+  class JsonUploadStatus;
   class JsonLink;
   class JsonPhotoSize;
   class JsonPhoto;
@@ -1035,6 +1036,8 @@ class Client final : public WebhookActor::Callback {
   td::Status process_get_file_query(PromisedQueryPtr &query);
   td::Status process_status_get_file_query(PromisedQueryPtr &query);
   td::Status process_cancel_get_file_query(PromisedQueryPtr &query);
+  td::Status process_status_upload_query(PromisedQueryPtr &query);
+  td::Status process_cancel_upload_query(PromisedQueryPtr &query);
 
   void webhook_verified(td::string cached_ip_address) final;
   void webhook_success() final;
@@ -1069,6 +1072,41 @@ class Client final : public WebhookActor::Callback {
   void do_get_file(object_ptr<td_api::file> file, PromisedQueryPtr query);
   void do_cancel_get_file(object_ptr<td_api::file> file, PromisedQueryPtr query);
   void do_get_file_download_status(td::Result<object_ptr<td_api::file>> r_file, PromisedQueryPtr query);
+
+  struct UploadInfo {
+    enum class State : td::int8 { Queued, Uploading, Sending, Completed, Failed, Canceled };
+    State state = State::Queued;
+    const Query *query = nullptr;  // the send query while it is in progress
+    int64 chat_id = 0;
+    int64 message_id = 0;  // identifier of the yet unsent message
+    int32 file_id = 0;     // TDLib identifier of the file being uploaded
+    int64 uploaded_size = 0;
+    int64 total_size = 0;
+    bool is_cancel_requested = false;
+    int32 error_code = 0;
+    td::string error_message;
+    double finish_time = 0.0;  // 0 while the send query is in progress
+  };
+
+  static td::Slice get_upload_state_name(UploadInfo::State state);
+
+  static const td_api::file *get_message_content_file(const td_api::MessageContent *content);
+
+  td::Status register_upload(PromisedQueryPtr &query);
+
+  void on_upload_message_created(const td_api::message *message, td::Slice upload_id);
+
+  void on_upload_query_finished(td::string upload_id, int32 http_status_code, td::string error_message);
+
+  static void update_upload_progress(UploadInfo *upload, const td_api::file *file);
+
+  bool is_upload_cancel_requested(int64 chat_id, int64 message_id) const;
+
+  void cancel_upload_message(const UploadInfo *upload);
+
+  void untrack_upload_file(const td::string &upload_id, int32 file_id);
+
+  void delete_expired_uploads();
 
   bool is_file_being_downloaded(int32 file_id) const;
   void on_file_download(int32 file_id, td::Result<object_ptr<td_api::file>> r_file);
@@ -1635,6 +1673,11 @@ class Client final : public WebhookActor::Callback {
     PromisedQueryPtr query;
   };
   td::FlatHashMap<MessageFullId, YetUnsentStory, MessageFullIdHash> yet_unsent_stories_;
+
+  static constexpr double UPLOAD_STATUS_KEEP_TIME = 60.0;  // how long a finished upload status is kept
+  static constexpr size_t MAX_UPLOAD_ID_LENGTH = 128;
+  td::FlatHashMap<td::string, td::unique_ptr<UploadInfo>> uploads_;      // upload_id -> UploadInfo
+  td::FlatHashMap<int32, td::vector<td::string>> upload_file_upload_ids_;  // file_id -> upload_ids
 
   struct PendingSendMessageQuery {
     PromisedQueryPtr query;

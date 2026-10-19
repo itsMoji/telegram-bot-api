@@ -406,6 +406,8 @@ bool Client::init_methods() {
   methods_.emplace("getfile", &Client::process_get_file_query);
   methods_.emplace("statusgetfile", &Client::process_status_get_file_query);
   methods_.emplace("cancelgetfile", &Client::process_cancel_get_file_query);
+  methods_.emplace("statusupload", &Client::process_status_upload_query);
+  methods_.emplace("cancelupload", &Client::process_cancel_upload_query);
   return true;
 }
 
@@ -452,6 +454,27 @@ class Client::JsonFileDownloadStatus final : public td::Jsonable {
 
  private:
   const td_api::file *file_;
+};
+
+class Client::JsonUploadStatus final : public td::Jsonable {
+ public:
+  JsonUploadStatus(td::Slice upload_id, const UploadInfo *upload) : upload_id_(upload_id), upload_(upload) {
+  }
+  void store(td::JsonValueScope *scope) const {
+    auto object = scope->enter_object();
+    object("upload_id", upload_id_);
+    object("state", get_upload_state_name(upload_->state));
+    object("uploaded_size", upload_->uploaded_size);
+    object("total_size", upload_->total_size);
+    if (upload_->state == UploadInfo::State::Failed) {
+      object("error_code", upload_->error_code);
+      object("error_message", upload_->error_message);
+    }
+  }
+
+ private:
+  td::Slice upload_id_;
+  const UploadInfo *upload_;
 };
 
 class Client::JsonDatedFile final : public td::Jsonable {
@@ -9391,6 +9414,15 @@ td_api::object_ptr<td_api::Object> Client::execute(object_ptr<td_api::Function> 
 
 void Client::on_update_file(object_ptr<td_api::file> file) {
   auto file_id = file->id_;
+  auto upload_it = upload_file_upload_ids_.find(file_id);
+  if (upload_it != upload_file_upload_ids_.end()) {
+    for (const auto &upload_id : upload_it->second) {
+      auto it = uploads_.find(upload_id);
+      if (it != uploads_.end()) {
+        update_upload_progress(it->second.get(), file.get());
+      }
+    }
+  }
   if (!is_file_being_downloaded(file_id)) {
     return;
   }
@@ -14059,6 +14091,7 @@ td::Status Client::process_send_audio_query(PromisedQueryPtr &query) {
   auto title = query->arg("title").str();
   auto performer = query->arg("performer").str();
   TRY_RESULT(caption, get_caption(query.get()));
+  TRY_STATUS(register_upload(query));
   do_send_message(
       make_object<td_api::inputMessageAudio>(
           make_object<td_api::inputAudio>(std::move(audio), std::move(thumbnail), duration, title, performer),
@@ -14081,6 +14114,7 @@ td::Status Client::process_send_document_query(PromisedQueryPtr &query) {
   auto thumbnail = get_input_thumbnail(query.get());
   TRY_RESULT(caption, get_caption(query.get()));
   bool disable_content_type_detection = to_bool(query->arg("disable_content_type_detection"));
+  TRY_STATUS(register_upload(query));
   do_send_message(
       make_object<td_api::inputMessageDocument>(
           make_object<td_api::inputDocument>(std::move(document), std::move(thumbnail), disable_content_type_detection),
@@ -14151,6 +14185,7 @@ td::Status Client::process_send_video_query(PromisedQueryPtr &query) {
   TRY_RESULT(caption, get_caption(query.get()));
   auto show_caption_above_media = to_bool(query->arg("show_caption_above_media"));
   auto has_spoiler = to_bool(query->arg("has_spoiler"));
+  TRY_STATUS(register_upload(query));
   do_send_message(
       make_object<td_api::inputMessageVideo>(
           make_object<td_api::inputVideo>(std::move(video), std::move(thumbnail), std::move(cover), start_timestamp,
@@ -17118,6 +17153,263 @@ void Client::do_cancel_get_file(object_ptr<td_api::file> file, PromisedQueryPtr 
   }
 }
 
+td::Slice Client::get_upload_state_name(UploadInfo::State state) {
+  switch (state) {
+    case UploadInfo::State::Queued:
+      return td::Slice("queued");
+    case UploadInfo::State::Uploading:
+      return td::Slice("uploading");
+    case UploadInfo::State::Sending:
+      return td::Slice("sending");
+    case UploadInfo::State::Completed:
+      return td::Slice("completed");
+    case UploadInfo::State::Failed:
+      return td::Slice("failed");
+    case UploadInfo::State::Canceled:
+      return td::Slice("canceled");
+    default:
+      UNREACHABLE();
+      return td::Slice();
+  }
+}
+
+const td_api::file *Client::get_message_content_file(const td_api::MessageContent *content) {
+  if (content == nullptr) {
+    return nullptr;
+  }
+  switch (content->get_id()) {
+    case td_api::messageAudio::ID:
+      return static_cast<const td_api::messageAudio *>(content)->audio_->audio_.get();
+    case td_api::messageDocument::ID:
+      return static_cast<const td_api::messageDocument *>(content)->document_->document_.get();
+    case td_api::messageVideo::ID:
+      return static_cast<const td_api::messageVideo *>(content)->video_->video_.get();
+    case td_api::messageAnimation::ID:
+      return static_cast<const td_api::messageAnimation *>(content)->animation_->animation_.get();
+    case td_api::messageVoiceNote::ID:
+      return static_cast<const td_api::messageVoiceNote *>(content)->voice_note_->voice_.get();
+    case td_api::messageVideoNote::ID:
+      return static_cast<const td_api::messageVideoNote *>(content)->video_note_->video_.get();
+    default:
+      return nullptr;
+  }
+}
+
+td::Status Client::register_upload(PromisedQueryPtr &query) {
+  auto upload_id = query->arg("upload_id");
+  if (upload_id.empty()) {
+    return td::Status::OK();
+  }
+  if (upload_id.size() > MAX_UPLOAD_ID_LENGTH || !td::check_utf8(upload_id.str())) {
+    return td::Status::Error(400, "invalid upload_id specified");
+  }
+
+  delete_expired_uploads();
+  auto &upload = uploads_[upload_id.str()];
+  if (upload != nullptr) {
+    if (upload->query == query.get()) {
+      return td::Status::OK();
+    }
+    if (upload->finish_time == 0.0) {
+      return td::Status::Error(400, "upload_id is already in use");
+    }
+  }
+  upload = td::make_unique<UploadInfo>();
+  upload->query = query.get();
+
+  // get notified when the send query is answered, however it is answered
+  auto &deleter = query.get_deleter();
+  auto promise = deleter.release_promise();
+  deleter = PromiseDeleter(td::PromiseCreator::lambda(
+      [actor_id = actor_id(this), upload_id = upload_id.str(),
+       promise = std::move(promise)](td::Result<td::unique_ptr<Query>> r_query) mutable {
+        if (r_query.is_error()) {
+          send_closure_later(actor_id, &Client::on_upload_query_finished, std::move(upload_id), 500,
+                             td::string("Internal Server Error: query was lost"));
+          return promise.set_error(r_query.move_as_error());
+        }
+        auto finished_query = r_query.move_as_ok();
+        auto http_status_code = finished_query->http_status_code();
+        td::string error_message;
+        if (http_status_code != 200) {
+          auto answer = finished_query->answer().as_slice().str();
+          auto r_value = td::json_decode(answer);
+          if (r_value.is_ok() && r_value.ok_ref().type() == td::JsonValue::Type::Object) {
+            auto r_description = r_value.ok_ref().get_object().get_optional_string_field("description");
+            if (r_description.is_ok()) {
+              error_message = r_description.move_as_ok();
+            }
+          }
+        }
+        send_closure_later(actor_id, &Client::on_upload_query_finished, std::move(upload_id), http_status_code,
+                           std::move(error_message));
+        promise.set_value(std::move(finished_query));
+      }));
+  return td::Status::OK();
+}
+
+void Client::on_upload_message_created(const td_api::message *message, td::Slice upload_id) {
+  auto it = uploads_.find(upload_id.str());
+  if (it == uploads_.end()) {
+    return;
+  }
+  auto *upload = it->second.get();
+  if (upload->finish_time != 0.0 || upload->message_id != 0) {
+    return;
+  }
+
+  upload->chat_id = message->chat_id_;
+  upload->message_id = message->id_;
+  upload->state = UploadInfo::State::Uploading;
+  auto file = get_message_content_file(message->content_.get());
+  if (file != nullptr) {
+    upload->file_id = file->id_;
+    upload_file_upload_ids_[file->id_].push_back(upload_id.str());
+    update_upload_progress(upload, file);
+  }
+
+  if (upload->is_cancel_requested) {
+    cancel_upload_message(upload);
+  }
+}
+
+void Client::update_upload_progress(UploadInfo *upload, const td_api::file *file) {
+  if (upload->finish_time != 0.0) {
+    return;
+  }
+  upload->total_size = file->size_ != 0 ? file->size_ : file->expected_size_;
+  if (file->remote_->is_uploading_completed_) {
+    upload->uploaded_size = upload->total_size;
+    upload->state = UploadInfo::State::Sending;
+  } else {
+    upload->uploaded_size = file->remote_->uploaded_size_;
+    upload->state = UploadInfo::State::Uploading;
+  }
+}
+
+void Client::on_upload_query_finished(td::string upload_id, int32 http_status_code, td::string error_message) {
+  auto it = uploads_.find(upload_id);
+  if (it == uploads_.end()) {
+    return;
+  }
+  auto *upload = it->second.get();
+  if (upload->finish_time != 0.0) {
+    return;
+  }
+
+  untrack_upload_file(upload_id, upload->file_id);
+  upload->query = nullptr;
+  upload->finish_time = td::Time::now();
+  if (http_status_code == 200) {
+    upload->state = UploadInfo::State::Completed;
+    upload->uploaded_size = upload->total_size;
+  } else if (upload->is_cancel_requested) {
+    upload->state = UploadInfo::State::Canceled;
+  } else {
+    upload->state = UploadInfo::State::Failed;
+    upload->error_code = http_status_code;
+    upload->error_message = std::move(error_message);
+  }
+}
+
+bool Client::is_upload_cancel_requested(int64 chat_id, int64 message_id) const {
+  auto yet_unsent_message_it = yet_unsent_messages_.find({chat_id, message_id});
+  if (yet_unsent_message_it == yet_unsent_messages_.end()) {
+    return false;
+  }
+  auto query_it = pending_send_message_queries_.find(yet_unsent_message_it->second.send_message_query_id);
+  if (query_it == pending_send_message_queries_.end() || query_it->second->query == nullptr) {
+    return false;
+  }
+  auto upload_id = query_it->second->query->arg("upload_id");
+  if (upload_id.empty()) {
+    return false;
+  }
+  auto upload_it = uploads_.find(upload_id.str());
+  return upload_it != uploads_.end() && upload_it->second->is_cancel_requested;
+}
+
+void Client::cancel_upload_message(const UploadInfo *upload) {
+  // deleting a yet unsent message makes TDLib stop its upload; the send query then fails in delete_message
+  CHECK(upload->message_id != 0);
+  send_request(make_object<td_api::deleteMessages>(upload->chat_id, td::vector<int64>{upload->message_id}, true),
+               td::make_unique<TdOnOkCallback>());
+}
+
+void Client::untrack_upload_file(const td::string &upload_id, int32 file_id) {
+  if (file_id == 0) {
+    return;
+  }
+  auto it = upload_file_upload_ids_.find(file_id);
+  if (it == upload_file_upload_ids_.end()) {
+    return;
+  }
+  td::remove(it->second, upload_id);
+  if (it->second.empty()) {
+    upload_file_upload_ids_.erase(it);
+  }
+}
+
+void Client::delete_expired_uploads() {
+  auto now = td::Time::now();
+  td::table_remove_if(uploads_, [now](const auto &it) {
+    return it.second->finish_time != 0.0 && it.second->finish_time + UPLOAD_STATUS_KEEP_TIME < now;
+  });
+}
+
+td::Status Client::process_status_upload_query(PromisedQueryPtr &query) {
+  auto upload_id = query->arg("upload_id");
+  if (upload_id.empty()) {
+    return td::Status::Error(400, "upload_id is empty");
+  }
+  delete_expired_uploads();
+  auto it = uploads_.find(upload_id.str());
+  if (it == uploads_.end()) {
+    return td::Status::Error(400, "upload not found");
+  }
+  answer_query(JsonUploadStatus(upload_id, it->second.get()), std::move(query));
+  return td::Status::OK();
+}
+
+td::Status Client::process_cancel_upload_query(PromisedQueryPtr &query) {
+  auto upload_id = query->arg("upload_id");
+  if (upload_id.empty()) {
+    return td::Status::Error(400, "upload_id is empty");
+  }
+  delete_expired_uploads();
+  auto it = uploads_.find(upload_id.str());
+  if (it == uploads_.end()) {
+    return td::Status::Error(400, "upload not found");
+  }
+  auto *upload = it->second.get();
+  if (upload->finish_time != 0.0) {
+    answer_query(td::JsonFalse(), std::move(query),
+                 PSLICE() << "Upload is already " << get_upload_state_name(upload->state));
+    return td::Status::OK();
+  }
+  if (upload->is_cancel_requested) {
+    answer_query(td::JsonTrue(), std::move(query), td::Slice("Upload is already being canceled"));
+    return td::Status::OK();
+  }
+
+  if (upload->message_id == 0) {
+    // the message isn't created yet; it will be deleted as soon as it is
+    upload->is_cancel_requested = true;
+    answer_query(td::JsonTrue(), std::move(query), td::Slice("Upload will be canceled"));
+    return td::Status::OK();
+  }
+  if (yet_unsent_messages_.count({upload->chat_id, upload->message_id}) == 0) {
+    // the message has just been sent; the send query is about to be answered
+    answer_query(td::JsonFalse(), std::move(query), td::Slice("Upload is already completed"));
+    return td::Status::OK();
+  }
+
+  upload->is_cancel_requested = true;
+  cancel_upload_message(upload);
+  answer_query(td::JsonTrue(), std::move(query), td::Slice("Upload canceled"));
+  return td::Status::OK();
+}
+
 bool Client::is_file_being_downloaded(int32 file_id) const {
   return file_download_listeners_.count(file_id) > 0;
 }
@@ -17520,6 +17812,13 @@ void Client::on_sent_message(object_ptr<td_api::message> &&message, int64 query_
   auto &query = *pending_send_message_queries_[query_id];
   query.awaited_message_count++;
   query.total_message_count++;
+
+  if (!query.is_multisend && query.query != nullptr) {
+    auto upload_id = query.query->arg("upload_id");
+    if (!upload_id.empty()) {
+      on_upload_message_created(message.get(), upload_id);
+    }
+  }
 }
 
 void Client::on_sent_story(object_ptr<td_api::story> &&story, PromisedQueryPtr query) {
@@ -19585,7 +19884,9 @@ td::unique_ptr<Client::MessageInfo> Client::delete_message(int64 chat_id, int64 
 
       auto error = make_object<td_api::error>(
           500, "Internal Server Error: sent message was immediately deleted and can't be returned");
-      if (chat_info->type == ChatInfo::Type::Supergroup) {
+      if (is_upload_cancel_requested(chat_id, message_id)) {
+        error = make_object<td_api::error>(400, "Bad Request: upload was canceled");
+      } else if (chat_info->type == ChatInfo::Type::Supergroup) {
         auto supergroup_info = get_supergroup_info(chat_info->supergroup_id);
         CHECK(supergroup_info != nullptr);
         if (supergroup_info->status->get_id() == td_api::chatMemberStatusBanned::ID ||
