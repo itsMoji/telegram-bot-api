@@ -1,5 +1,5 @@
 //
-// Copyright Aliaksei Levin (levlam@telegram.org), Arseny Smirnov (arseny30@gmail.com) 2014-2021
+// Copyright Aliaksei Levin (levlam@telegram.org), Arseny Smirnov (arseny30@gmail.com) 2014-2026
 //
 // Distributed under the Boost Software License, Version 1.0. (See accompanying
 // file LICENSE_1_0.txt or copy at http://www.boost.org/LICENSE_1_0.txt)
@@ -86,6 +86,8 @@ void print_log() {
 
 static std::atomic_bool has_failed{false};
 
+static std::atomic_flag need_dump_statistics;
+
 static void dump_stacktrace_signal_handler(int sig) {
   if (has_failed) {
     return;
@@ -96,10 +98,12 @@ static void dump_stacktrace_signal_handler(int sig) {
     td::signal_safe_write(td::Slice("\n"), false);
   }
   td::Stacktrace::print_to_stderr();
+  need_dump_statistics.clear();
 }
 
 static void fail_signal_handler(int sig) {
   has_failed = true;
+  print_log();
   {
     td::LogGuard log_guard;
     td::signal_safe_write_signal_number(sig);
@@ -107,7 +111,6 @@ static void fail_signal_handler(int sig) {
     options.use_gdb = true;
     td::Stacktrace::print_to_stderr(options);
   }
-  print_log();
   _Exit(EXIT_FAILURE);
 }
 
@@ -139,6 +142,7 @@ int main(int argc, char *argv[]) {
   need_reopen_log.test_and_set();
   need_quit.test_and_set();
   need_change_verbosity_level.test_and_set();
+  need_dump_statistics.test_and_set();
   need_dump_log.test_and_set();
 
   td::Stacktrace::init();
@@ -161,7 +165,7 @@ int main(int argc, char *argv[]) {
   auto start_time = td::Time::now();
   auto shared_data = std::make_shared<SharedData>();
   auto parameters = std::make_unique<ClientParameters>();
-  parameters->version_ = "6.3.3";
+  parameters->version_ = "10.3";
   parameters->shared_data_ = shared_data;
   parameters->start_time_ = start_time;
   auto net_query_stats = td::create_net_query_stats();
@@ -179,6 +183,7 @@ int main(int argc, char *argv[]) {
   int memory_verbosity_level = VERBOSITY_NAME(INFO);
   td::int64 log_max_file_size = 2000000000;
   td::string working_directory = PSTRING() << "." << TD_DIR_SLASH;
+  td::string files_directory;
   td::string temporary_directory;
   td::string username;
   td::string groupname;
@@ -220,6 +225,8 @@ int main(int argc, char *argv[]) {
   options.add_checked_option('s', "http-stat-port", "HTTP statistics port",
                              td::OptionParser::parse_integer(http_stat_port));
   options.add_option('d', "dir", "server working directory", td::OptionParser::parse_string(working_directory));
+  options.add_option('f', "files-dir", "directory for storing auxiliary files (defaults to the working directory)",
+                     td::OptionParser::parse_string(files_directory));
   options.add_option('t', "temp-dir", "directory for storing HTTP server temporary files",
                      td::OptionParser::parse_string(temporary_directory));
   options.add_checked_option('\0', "filter",
@@ -396,9 +403,43 @@ int main(int argc, char *argv[]) {
       td::rmdir(r_temp_dir.ok()).ensure();
     }
 
+    if (files_directory.empty()) {
+      files_directory = working_directory;
+    } else {
+      TRY_RESULT_PREFIX_ASSIGN(files_directory, td::realpath(files_directory, true),
+                               "Invalid files directory specified: ");
+      if (files_directory.empty()) {
+        return td::Status::Error("Empty path specified as files directory");
+      }
+      if (files_directory.back() != TD_DIR_SLASH) {
+        files_directory += TD_DIR_SLASH;
+      }
+
+      TRY_STATUS_PREFIX(td::mkpath(files_directory, 0750), "Failed to create files directory: ");
+
+      auto r_temp_file = td::mkstemp(files_directory);
+      if (r_temp_file.is_error()) {
+        return td::Status::Error(PSLICE() << "Can't create files in the directory \"" << files_directory
+                                          << "\". Use --files-dir option to specify a writable files directory");
+      }
+      r_temp_file.ok_ref().first.close();
+      td::unlink(r_temp_file.ok().second).ensure();
+
+      auto r_temp_dir = td::mkdtemp(files_directory, "1:a");
+      if (r_temp_dir.is_error()) {
+        parameters->allow_colon_in_filenames_ = false;
+        r_temp_dir = td::mkdtemp(files_directory, "1~a");
+        if (r_temp_dir.is_error()) {
+          return td::Status::Error(PSLICE() << "Can't create directories in the directory \"" << files_directory
+                                            << "\". Use --files-dir option to specify a writable files directory");
+        }
+      }
+      td::rmdir(r_temp_dir.ok()).ensure();
+    }
+
     if (!temporary_directory.empty()) {
       if (td::PathView(temporary_directory).is_relative()) {
-        temporary_directory = working_directory + temporary_directory;
+        temporary_directory = files_directory + temporary_directory;
       }
       TRY_STATUS_PREFIX(td::set_temporary_dir(temporary_directory), "Can't set temporary directory: ");
     }
@@ -421,7 +462,7 @@ int main(int argc, char *argv[]) {
 
     if (!log_file_path.empty()) {
       if (td::PathView(log_file_path).is_relative()) {
-        log_file_path = working_directory + log_file_path;
+        log_file_path = files_directory + log_file_path;
       }
       TRY_STATUS_PREFIX(file_log.init(log_file_path, log_max_file_size), "Can't open log file: ");
       log.set_first(&file_log);
@@ -436,6 +477,7 @@ int main(int argc, char *argv[]) {
   }
 
   parameters->working_directory_ = std::move(working_directory);
+  parameters->files_directory_ = std::move(files_directory);
 
   if (parameters->default_max_webhook_connections_ <= 0) {
     parameters->default_max_webhook_connections_ = parameters->local_mode_ ? 100 : 40;
@@ -455,27 +497,22 @@ int main(int argc, char *argv[]) {
   //              << (td::GitInfo::is_dirty() ? "(dirty)" : "") << " started";
   LOG(WARNING) << "Bot API " << parameters->version_ << " server started";
 
-  // +3 threads for Td
-  // one thread for ClientManager and all Clients
-  // one thread for watchdogs
-  // one thread for slow HTTP connections
-  // one thread for DNS resolving
-  const int thread_count = 7;
-  td::ConcurrentScheduler sched(thread_count, cpu_affinity);
+  td::ConcurrentScheduler sched(SharedData::get_thread_count() - 1, cpu_affinity);
 
   td::GetHostByNameActor::Options get_host_by_name_options;
-  get_host_by_name_options.scheduler_id = thread_count;
+  get_host_by_name_options.scheduler_id = SharedData::get_dns_resolver_scheduler_id();
   parameters->get_host_by_name_actor_id_ =
       sched.create_actor_unsafe<td::GetHostByNameActor>(0, "GetHostByName", std::move(get_host_by_name_options))
           .release();
 
-  auto client_manager =
-      sched.create_actor_unsafe<ClientManager>(thread_count - 3, "ClientManager", std::move(parameters), token_range)
-          .release();
+  auto client_manager = sched
+                            .create_actor_unsafe<ClientManager>(SharedData::get_client_scheduler_id(), "ClientManager",
+                                                                std::move(parameters), token_range)
+                            .release();
 
   sched
       .create_actor_unsafe<HttpServer>(
-          thread_count - 3, "HttpServer", http_ip_address, http_port,
+          SharedData::get_client_scheduler_id(), "HttpServer", http_ip_address, http_port,
           [client_manager, shared_data] {
             return td::ActorOwn<td::HttpInboundConnection::Callback>(
                 td::create_actor<HttpConnection>("HttpConnection", client_manager, shared_data));
@@ -485,7 +522,7 @@ int main(int argc, char *argv[]) {
   if (http_stat_port != 0) {
     sched
         .create_actor_unsafe<HttpServer>(
-            thread_count - 3, "HttpStatsServer", http_stat_ip_address, http_stat_port,
+            SharedData::get_client_scheduler_id(), "HttpStatsServer", http_stat_ip_address, http_stat_port,
             [client_manager] {
               return td::ActorOwn<td::HttpInboundConnection::Callback>(
                   td::create_actor<HttpStatConnection>("HttpStatConnection", client_manager));
@@ -493,9 +530,9 @@ int main(int argc, char *argv[]) {
         .release();
   }
 
-  constexpr double WATCHDOG_TIMEOUT = 0.5;
-  auto watchdog_id =
-      sched.create_actor_unsafe<Watchdog>(thread_count - 2, "Watchdog", td::this_thread::get_id(), WATCHDOG_TIMEOUT);
+  constexpr double WATCHDOG_TIMEOUT = 0.25;
+  auto watchdog_id = sched.create_actor_unsafe<Watchdog>(SharedData::get_watchdog_scheduler_id(), "Watchdog",
+                                                         td::this_thread::get_id(), WATCHDOG_TIMEOUT);
 
   sched.start();
 
@@ -548,8 +585,7 @@ int main(int argc, char *argv[]) {
 
     if (!need_dump_log.test_and_set()) {
       print_log();
-      auto guard = sched.get_main_guard();
-      send_closure(client_manager, &ClientManager::dump_statistics);
+      need_dump_statistics.clear();
     }
 
     double now = td::Time::now();
@@ -558,16 +594,18 @@ int main(int argc, char *argv[]) {
         next_cron_time = now;
       }
       next_cron_time += 1.0;
-      ServerCpuStat::update(now);
+      auto guard = sched.get_main_guard();
+      td::Scheduler::instance()->run_on_scheduler(SharedData::get_statistics_thread_id(),
+                                                  [](td::Unit) { ServerCpuStat::update(td::Time::now()); });
     }
 
     if (now >= start_time + 600) {
       auto guard = sched.get_main_guard();
       send_closure(watchdog_id, &Watchdog::kick);
-      next_watchdog_kick_time = now + WATCHDOG_TIMEOUT / 2;
+      next_watchdog_kick_time = now + WATCHDOG_TIMEOUT / 10;
     }
 
-    if (now > last_dump_time + 300.0) {
+    if (!need_dump_statistics.test_and_set() || now > last_dump_time + 300.0) {
       last_dump_time = now;
       auto guard = sched.get_main_guard();
       send_closure(client_manager, &ClientManager::dump_statistics);

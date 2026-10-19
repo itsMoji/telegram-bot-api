@@ -1,5 +1,5 @@
 //
-// Copyright Aliaksei Levin (levlam@telegram.org), Arseny Smirnov (arseny30@gmail.com) 2014-2021
+// Copyright Aliaksei Levin (levlam@telegram.org), Arseny Smirnov (arseny30@gmail.com) 2014-2026
 //
 // Distributed under the Boost Software License, Version 1.0. (See accompanying
 // file LICENSE_1_0.txt or copy at http://www.boost.org/LICENSE_1_0.txt)
@@ -38,41 +38,49 @@ class Query final : public td::ListNode {
   td::Slice token() const {
     return token_;
   }
+
   bool is_test_dc() const {
     return is_test_dc_;
   }
+
   td::Slice method() const {
     return method_;
   }
+
   bool has_arg(td::Slice key) const {
     auto it = std::find_if(args_.begin(), args_.end(),
                            [&key](const std::pair<td::MutableSlice, td::MutableSlice> &s) { return s.first == key; });
     return it != args_.end();
   }
+
   td::MutableSlice arg(td::Slice key) const {
     auto it = std::find_if(args_.begin(), args_.end(),
                            [&key](const std::pair<td::MutableSlice, td::MutableSlice> &s) { return s.first == key; });
     return it == args_.end() ? td::MutableSlice() : it->second;
   }
+
   const td::vector<std::pair<td::MutableSlice, td::MutableSlice>> &args() const {
     return args_;
   }
+
   td::Slice get_header(td::Slice key) const {
     auto it = std::find_if(headers_.begin(), headers_.end(),
                            [&key](const std::pair<td::MutableSlice, td::MutableSlice> &s) { return s.first == key; });
     return it == headers_.end() ? td::Slice() : it->second;
   }
+
   const td::HttpFile *file(td::Slice key) const {
     auto it = std::find_if(files_.begin(), files_.end(), [&key](const td::HttpFile &f) { return f.field_name == key; });
     return it == files_.end() ? nullptr : &*it;
   }
+
   const td::vector<td::HttpFile> &files() const {
     return files_;
   }
 
-  const td::IPAddress &peer_address() const {
-    return peer_address_;
-  }
+  td::int64 files_size() const;
+
+  td::string get_peer_ip_address() const;
 
   td::BufferSlice &answer() {
     return answer_;
@@ -103,7 +111,7 @@ class Query final : public td::ListNode {
   Query(td::vector<td::BufferSlice> &&container, td::Slice token, bool is_test_dc, td::MutableSlice method,
         td::vector<std::pair<td::MutableSlice, td::MutableSlice>> &&args,
         td::vector<std::pair<td::MutableSlice, td::MutableSlice>> &&headers, td::vector<td::HttpFile> &&files,
-        std::shared_ptr<SharedData> shared_data, const td::IPAddress &peer_address, bool is_internal);
+        std::shared_ptr<SharedData> shared_data, const td::IPAddress &peer_ip_address, bool is_internal);
   Query(const Query &) = delete;
   Query &operator=(const Query &) = delete;
   Query(Query &&) = delete;
@@ -114,6 +122,8 @@ class Query final : public td::ListNode {
       if (!empty()) {
         shared_data_->query_list_size_.fetch_sub(1, std::memory_order_relaxed);
       }
+      td::Scheduler::instance()->destroy_on_scheduler(SharedData::get_file_gc_scheduler_id(), container_, args_,
+                                                      headers_, files_, answer_);
     }
   }
 
@@ -127,7 +137,7 @@ class Query final : public td::ListNode {
   State state_;
   std::shared_ptr<SharedData> shared_data_;
   double start_timestamp_;
-  td::IPAddress peer_address_;
+  td::IPAddress peer_ip_address_;
   td::ActorId<BotStatActor> stat_actor_;
 
   // request
@@ -151,8 +161,6 @@ class Query final : public td::ListNode {
   }
 
   td::int64 query_size() const;
-
-  td::int64 files_size() const;
 
   td::int64 files_max_size() const;
 
@@ -206,23 +214,15 @@ class JsonQueryOk final : public td::Jsonable {
 class JsonQueryError final : public td::Jsonable {
  public:
   JsonQueryError(
-      int error_code, td::Slice description,
+      int error_code, td::CSlice description,
       const td::FlatHashMap<td::string, td::unique_ptr<td::VirtuallyJsonable>> &parameters = empty_parameters)
       : error_code_(error_code), description_(description), parameters_(parameters) {
   }
-  void store(td::JsonValueScope *scope) const {
-    auto object = scope->enter_object();
-    object("ok", td::JsonFalse());
-    object("error_code", error_code_);
-    object("description", description_);
-    if (!parameters_.empty()) {
-      object("parameters", JsonParameters(parameters_));
-    }
-  }
+  void store(td::JsonValueScope *scope) const;
 
  private:
   int error_code_;
-  td::Slice description_;
+  td::CSlice description_;
   const td::FlatHashMap<td::string, td::unique_ptr<td::VirtuallyJsonable>> &parameters_;
 };
 
@@ -261,7 +261,7 @@ void answer_query(const Jsonable &result, PromisedQueryPtr query, td::Slice desc
 }
 
 inline void fail_query(
-    int http_status_code, td::Slice description, PromisedQueryPtr query,
+    int http_status_code, td::CSlice description, PromisedQueryPtr query,
     const td::FlatHashMap<td::string, td::unique_ptr<td::VirtuallyJsonable>> &parameters = empty_parameters) {
   query->set_error(http_status_code,
                    td::json_encode<td::BufferSlice>(JsonQueryError(http_status_code, description, parameters)));

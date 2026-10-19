@@ -1,5 +1,5 @@
 //
-// Copyright Aliaksei Levin (levlam@telegram.org), Arseny Smirnov (arseny30@gmail.com) 2014-2021
+// Copyright Aliaksei Levin (levlam@telegram.org), Arseny Smirnov (arseny30@gmail.com) 2014-2026
 //
 // Distributed under the Boost Software License, Version 1.0. (See accompanying
 // file LICENSE_1_0.txt or copy at http://www.boost.org/LICENSE_1_0.txt)
@@ -47,10 +47,8 @@ WebhookActor::WebhookActor(td::ActorShared<Callback> callback, td::int64 tqueue_
     , fix_ip_address_(fix_ip_address)
     , from_db_flag_(from_db_flag)
     , max_connections_(max_connections)
-    , secret_token_(std::move(secret_token))
-    , slow_scheduler_id_(td::Scheduler::instance()->sched_count() - 2) {
+    , secret_token_(std::move(secret_token)) {
   CHECK(max_connections_ > 0);
-  CHECK(slow_scheduler_id_ > 0);
 
   if (!cached_ip_address.empty()) {
     auto r_ip_address = td::IPAddress::get_ip_address(cached_ip_address);
@@ -64,6 +62,7 @@ WebhookActor::WebhookActor(td::ActorShared<Callback> callback, td::int64 tqueue_
   if (r_ascii_host.is_ok()) {
     url_.host_ = r_ascii_host.move_as_ok();
   }
+  host_header_ = td::HttpHeaderCreator::get_host_header(url_.protocol_, url_.host_, url_.port_);
 
   LOG(INFO) << "Set webhook for " << tqueue_id << " with certificate = \"" << cert_path_
             << "\", protocol = " << (url_.protocol_ == td::HttpUrl::Protocol::Http ? "http" : "https")
@@ -73,7 +72,7 @@ WebhookActor::WebhookActor(td::ActorShared<Callback> callback, td::int64 tqueue_
 
 WebhookActor::~WebhookActor() {
   td::Scheduler::instance()->destroy_on_scheduler(SharedData::get_file_gc_scheduler_id(), update_map_, queue_updates_,
-                                                  queues_);
+                                                  queues_, ssl_ctx_);
 }
 
 void WebhookActor::relax_wakeup_at(double wakeup_at, const char *source) {
@@ -150,7 +149,7 @@ td::Status WebhookActor::create_connection() {
       return create_webhook_error("Can't connect to the webhook proxy", r_proxy_socket_fd.move_as_error(), false);
     }
     if (!was_checked_) {
-      // verify webhook even we can't establish connection to the webhook
+      // verify webhook even if we can't establish connection to the webhook
       was_checked_ = true;
       on_webhook_verified();
     }
@@ -207,7 +206,7 @@ td::Status WebhookActor::create_webhook_error(td::Slice error_message, td::Statu
     on_webhook_error(error_message);
   }
   on_error(std::move(result));
-  return std::move(error);
+  return error;
 }
 
 td::Result<td::SslStream> WebhookActor::create_ssl_stream() {
@@ -229,8 +228,9 @@ td::Status WebhookActor::create_connection(td::BufferedFd<td::SocketFd> fd) {
   auto id = connections_.create(Connection());
   auto *conn = connections_.get(id);
   conn->actor_id_ = td::create_actor<td::HttpOutboundConnection>(
-      PSLICE() << "Connect:" << id, std::move(fd), std::move(ssl_stream), 0, 20, 60,
-      td::ActorShared<td::HttpOutboundConnection::Callback>(actor_id(this), id), slow_scheduler_id_);
+      PSLICE() << "Connect:" << id, std::move(fd), std::move(ssl_stream), 0, 50, 60,
+      td::ActorShared<td::HttpOutboundConnection::Callback>(actor_id(this), id),
+      SharedData::get_slow_outgoing_http_scheduler_id());
   conn->ip_generation_ = ip_generation_;
   conn->event_id_ = {};
   conn->id_ = id;
@@ -399,7 +399,7 @@ void WebhookActor::load_updates() {
     CHECK(update.id.is_valid());
     auto &dest_ptr = update_map_[update.id];
     if (dest_ptr != nullptr) {
-      LOG(ERROR) << "Receive duplicated event " << update.id << " from TQueue";
+      LOG(ERROR) << "Receive duplicate event " << update.id << " from TQueue";
       continue;
     }
     dest_ptr = td::make_unique<Update>();
@@ -504,7 +504,8 @@ void WebhookActor::on_update_error(td::TQueue::EventId event_id, td::Slice error
   int next_delay = update.delay_;
   int next_effective_delay = retry_after;
   if (retry_after == 0 && update.fail_count_ > 0) {
-    next_delay = td::min(WEBHOOK_MAX_RESEND_TIMEOUT, next_delay * 2);
+    auto max_timeout = td::Random::fast(WEBHOOK_MAX_RESEND_TIMEOUT, WEBHOOK_MAX_RESEND_TIMEOUT * 2);
+    next_delay = td::min(max_timeout, next_delay * 2);
     next_effective_delay = next_delay;
   }
   if (parameters_->shared_data_->get_unix_time(now) + next_effective_delay > update.expires_at_) {
@@ -552,7 +553,7 @@ td::Status WebhookActor::send_update() {
 
   td::HttpHeaderCreator hc;
   hc.init_post(url_.query_);
-  hc.add_header("Host", url_.host_);
+  hc.add_header("Host", host_header_);
   if (!url_.userinfo_.empty()) {
     hc.add_header("Authorization", PSLICE() << "Basic " << td::base64_encode(url_.userinfo_));
   }
@@ -589,11 +590,15 @@ void WebhookActor::send_updates() {
 }
 
 void WebhookActor::handle(td::unique_ptr<td::HttpQuery> response) {
+  SCOPE_EXIT {
+    td::Scheduler::instance()->destroy_on_scheduler_unique_ptr(SharedData::get_file_gc_scheduler_id(), response);
+  };
+
   auto connection_id = get_link_token();
   if (response) {
-    VLOG(webhook) << "Got response from connection " << connection_id;
+    VLOG(webhook) << "Receive response from connection " << connection_id;
   } else {
-    VLOG(webhook) << "Got hangup from connection " << connection_id;
+    VLOG(webhook) << "Receive hangup from connection " << connection_id;
   }
   auto *connection_ptr = connections_.get(connection_id);
   if (connection_ptr == nullptr) {
@@ -617,10 +622,12 @@ void WebhookActor::handle(td::unique_ptr<td::HttpQuery> response) {
         if (!method.empty() && method != "deletewebhook" && method != "setwebhook" && method != "close" &&
             method != "logout" && !td::begins_with(method, "get")) {
           VLOG(webhook) << "Receive request " << method << " in response to webhook";
-          auto query = td::make_unique<Query>(std::move(response->container_), td::MutableSlice(), false,
-                                              td::MutableSlice(), std::move(response->args_),
-                                              std::move(response->headers_), std::move(response->files_),
-                                              parameters_->shared_data_, response->peer_address_, false);
+          response->container_.emplace_back(PSLICE() << (tqueue_id_ & ((static_cast<td::int64>(1) << 54) - 1)));
+          auto token = response->container_.back().as_slice();
+          auto query = td::make_unique<Query>(
+              std::move(response->container_), token, tqueue_id_ >= (static_cast<td::int64>(1) << 54),
+              td::MutableSlice(), std::move(response->args_), std::move(response->headers_),
+              std::move(response->files_), parameters_->shared_data_, response->peer_address_, false);
           auto promised_query = PromisedQueryPtr(query.release(), PromiseDeleter(td::Promise<td::unique_ptr<Query>>()));
           send_closure(callback_, &Callback::send, std::move(promised_query));
         }
@@ -684,9 +691,14 @@ void WebhookActor::handle(td::unique_ptr<td::HttpQuery> response) {
 void WebhookActor::start_up() {
   max_loaded_updates_ = max_connections_ * 2;
 
-  next_ip_address_resolve_time_ = last_success_time_ = td::Time::now() - 3600;
+  last_success_time_ = td::Time::now() - 2 * IP_ADDRESS_CACHE_TIME;
+  if (from_db_flag_) {
+    next_ip_address_resolve_time_ = td::Time::now() + td::Random::fast(0, IP_ADDRESS_CACHE_TIME);
+  } else {
+    next_ip_address_resolve_time_ = last_success_time_;
+  }
 
-  active_new_connection_flood_.add_limit(1, 20);
+  active_new_connection_flood_.add_limit(0.5, 10);
 
   pending_new_connection_flood_.add_limit(2, 1);
 
@@ -717,11 +729,12 @@ void WebhookActor::start_up() {
 
   if (url_.protocol_ != td::HttpUrl::Protocol::Http && !stop_flag_) {
     // asynchronously create SSL context
-    td::Scheduler::instance()->run_on_scheduler(
-        SharedData::get_database_scheduler_id(), [actor_id = actor_id(this), cert_path = cert_path_](td::Unit) mutable {
-          send_closure(actor_id, &WebhookActor::on_ssl_context_created,
-                       td::SslCtx::create(cert_path, td::SslCtx::VerifyPeer::On));
-        });
+    td::Scheduler::instance()->run_on_scheduler(SharedData::get_webhook_certificate_scheduler_id(),
+                                                [actor_id = actor_id(this), cert_path = cert_path_](td::Unit) mutable {
+                                                  send_closure(
+                                                      actor_id, &WebhookActor::on_ssl_context_created,
+                                                      td::SslCtx::create(cert_path, td::SslCtx::VerifyPeer::On));
+                                                });
   }
 
   yield();

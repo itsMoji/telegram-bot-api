@@ -1,5 +1,5 @@
 //
-// Copyright Aliaksei Levin (levlam@telegram.org), Arseny Smirnov (arseny30@gmail.com) 2014-2021
+// Copyright Aliaksei Levin (levlam@telegram.org), Arseny Smirnov (arseny30@gmail.com) 2014-2026
 //
 // Distributed under the Boost Software License, Version 1.0. (See accompanying
 // file LICENSE_1_0.txt or copy at http://www.boost.org/LICENSE_1_0.txt)
@@ -16,6 +16,7 @@
 #include "td/utils/port/IPAddress.h"
 #include "td/utils/SliceBuilder.h"
 #include "td/utils/Time.h"
+#include "td/utils/utf8.h"
 
 #include <numeric>
 
@@ -23,13 +24,27 @@ namespace telegram_bot_api {
 
 td::FlatHashMap<td::string, td::unique_ptr<td::VirtuallyJsonable>> empty_parameters;
 
+void JsonQueryError::store(td::JsonValueScope *scope) const {
+  auto object = scope->enter_object();
+  object("ok", td::JsonFalse());
+  object("error_code", error_code_);
+  if (td::check_utf8(description_)) {
+    object("description", description_);
+  } else {
+    object("description", td::JsonRawString(description_));
+  }
+  if (!parameters_.empty()) {
+    object("parameters", JsonParameters(parameters_));
+  }
+}
+
 Query::Query(td::vector<td::BufferSlice> &&container, td::Slice token, bool is_test_dc, td::MutableSlice method,
              td::vector<std::pair<td::MutableSlice, td::MutableSlice>> &&args,
              td::vector<std::pair<td::MutableSlice, td::MutableSlice>> &&headers, td::vector<td::HttpFile> &&files,
-             std::shared_ptr<SharedData> shared_data, const td::IPAddress &peer_address, bool is_internal)
+             std::shared_ptr<SharedData> shared_data, const td::IPAddress &peer_ip_address, bool is_internal)
     : state_(State::Query)
     , shared_data_(shared_data)
-    , peer_address_(peer_address)
+    , peer_ip_address_(peer_ip_address)
     , container_(std::move(container))
     , token_(token)
     , is_test_dc_(is_test_dc)
@@ -43,13 +58,22 @@ Query::Query(td::vector<td::BufferSlice> &&container, td::Slice token, bool is_t
   }
   td::to_lower_inplace(method_);
   start_timestamp_ = td::Time::now();
-  LOG(INFO) << "QUERY: create " << td::tag("ptr", this) << *this;
+  LOG(INFO) << "Query " << this << ": " << *this;
   if (shared_data_) {
     shared_data_->query_count_.fetch_add(1, std::memory_order_relaxed);
     if (method_ != "getupdates") {
       shared_data_->query_list_size_.fetch_add(1, std::memory_order_relaxed);
       shared_data_->query_list_.put(this);
     }
+  }
+}
+
+td::string Query::get_peer_ip_address() const {
+  if (peer_ip_address_.is_valid() && !peer_ip_address_.is_reserved()) {  // external connection
+    return peer_ip_address_.get_ip_str().str();
+  } else {
+    // invalid peer IP address or connection from the local network
+    return get_header("x-real-ip").str();
   }
 }
 
@@ -76,7 +100,7 @@ void Query::set_stat_actor(td::ActorId<BotStatActor> stat_actor) {
 
 void Query::set_ok(td::BufferSlice result) {
   CHECK(state_ == State::Query);
-  LOG(INFO) << "QUERY: got ok " << td::tag("ptr", this) << td::tag("text", result.as_slice());
+  LOG(INFO) << "Query " << this << ": " << td::tag("method", method_) << td::tag("text", result.as_slice());
   answer_ = std::move(result);
   state_ = State::OK;
   http_status_code_ = 200;
@@ -84,7 +108,7 @@ void Query::set_ok(td::BufferSlice result) {
 }
 
 void Query::set_error(int http_status_code, td::BufferSlice result) {
-  LOG(INFO) << "QUERY: got error " << td::tag("ptr", this) << td::tag("code", http_status_code)
+  LOG(INFO) << "Query " << this << ": " << td::tag("method", method_) << td::tag("code", http_status_code)
             << td::tag("text", result.as_slice());
   CHECK(state_ == State::Query);
   answer_ = std::move(result);
@@ -106,9 +130,25 @@ td::StringBuilder &operator<<(td::StringBuilder &sb, const Query &query) {
   auto padded_time =
       td::lpad(PSTRING() << td::format::as_time(td::Time::now_cached() - query.start_timestamp()), 10, ' ');
   sb << "[bot" << td::rpad(query.token().str(), 46, ' ') << "][time:" << padded_time << ']'
-     << td::tag("method", td::lpad(query.method().str(), 20, ' '));
+     << td::tag("method", td::lpad(query.method().str(), 25, ' '));
   if (!query.args().empty()) {
-    sb << td::oneline(PSLICE() << query.args());
+    sb << '{';
+    for (const auto &arg : query.args()) {
+      sb << '[';
+      if (arg.first.size() > 128) {
+        sb << '<' << arg.first.size() << '>' << td::oneline(arg.first.substr(0, 128)) << "...";
+      } else {
+        sb << td::oneline(arg.first);
+      }
+      sb << ':';
+      if (arg.second.size() > 4096) {
+        sb << '<' << arg.second.size() << '>' << td::oneline(arg.second.substr(0, 4096)) << "...";
+      } else {
+        sb << td::oneline(arg.second);
+      }
+      sb << ']';
+    }
+    sb << '}';
   }
   if (!query.files().empty()) {
     sb << query.files();

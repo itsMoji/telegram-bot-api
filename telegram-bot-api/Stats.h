@@ -1,5 +1,5 @@
 //
-// Copyright Aliaksei Levin (levlam@telegram.org), Arseny Smirnov (arseny30@gmail.com) 2014-2021
+// Copyright Aliaksei Levin (levlam@telegram.org), Arseny Smirnov (arseny30@gmail.com) 2014-2026
 //
 // Distributed under the Boost Software License, Version 1.0. (See accompanying
 // file LICENSE_1_0.txt or copy at http://www.boost.org/LICENSE_1_0.txt)
@@ -9,7 +9,6 @@
 #include "td/actor/actor.h"
 
 #include "td/utils/common.h"
-#include "td/utils/logging.h"
 #include "td/utils/port/Stat.h"
 #include "td/utils/Time.h"
 #include "td/utils/TimedStat.h"
@@ -49,30 +48,22 @@ class ServerCpuStat {
     static ServerCpuStat stat;
     return stat;
   }
-  static void update(double now) {
-    auto r_event = td::cpu_stat();
-    if (r_event.is_error()) {
-      return;
-    }
-    instance().add_event(r_event.ok(), now);
-    LOG(WARNING) << "CPU usage: " << instance().stat_[1].get_stat(now).as_vector()[0].value_;
-  }
 
-  td::string get_description() const;
+  static void update(double now);
+
+  static td::string get_description();
 
   td::vector<StatItem> as_vector(double now);
 
  private:
   static constexpr std::size_t SIZE = 4;
   static constexpr const char *DESCR[SIZE] = {"inf", "5sec", "1min", "1hour"};
-  static constexpr int DURATIONS[SIZE] = {0, 5, 60, 60 * 60};
+  static constexpr td::int32 DURATIONS[SIZE] = {0, 5, 60, 60 * 60};
 
   std::mutex mutex_;
   td::TimedStat<CpuStat> stat_[SIZE];
 
   ServerCpuStat();
-
-  void add_event(const td::CpuStat &stat, double now);
 };
 
 class ServerBotInfo {
@@ -156,7 +147,7 @@ class BotStatActor final : public td::Actor {
   }
 
   BotStatActor(const BotStatActor &) = delete;
-  BotStatActor &operator=(const BotStatActor &other) = delete;
+  BotStatActor &operator=(const BotStatActor &) = delete;
   BotStatActor(BotStatActor &&) = default;
   BotStatActor &operator=(BotStatActor &&other) noexcept {
     if (!empty()) {
@@ -183,7 +174,7 @@ class BotStatActor final : public td::Actor {
 
   td::vector<StatItem> as_vector(double now);
 
-  td::string get_description() const;
+  static td::string get_description();
 
   double get_score(double now);
 
@@ -200,7 +191,7 @@ class BotStatActor final : public td::Actor {
  private:
   static constexpr std::size_t SIZE = 4;
   static constexpr const char *DESCR[SIZE] = {"inf", "5sec", "1min", "1hour"};
-  static constexpr int DURATIONS[SIZE] = {0, 5, 60, 60 * 60};
+  static constexpr td::int32 DURATIONS[SIZE] = {0, 5, 60, 60 * 60};
 
   td::TimedStat<ServerBotStat> stat_[SIZE];
   td::ActorId<BotStatActor> parent_;

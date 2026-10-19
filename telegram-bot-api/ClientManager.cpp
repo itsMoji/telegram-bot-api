@@ -1,5 +1,5 @@
 //
-// Copyright Aliaksei Levin (levlam@telegram.org), Arseny Smirnov (arseny30@gmail.com) 2014-2021
+// Copyright Aliaksei Levin (levlam@telegram.org), Arseny Smirnov (arseny30@gmail.com) 2014-2026
 //
 // Distributed under the Boost Software License, Version 1.0. (See accompanying
 // file LICENSE_1_0.txt or copy at http://www.boost.org/LICENSE_1_0.txt)
@@ -77,7 +77,7 @@ void ClientManager::send(PromisedQueryPtr query) {
   }
   auto r_user_id = td::to_integer_safe<td::int64>(query->token().substr(0, token.find(':')));
   if (r_user_id.is_error() || !token_range_(r_user_id.ok())) {
-    return fail_query(421, "Misdirected Request: unallowed token specified", std::move(query));
+    return fail_query(421, "Misdirected Request: forbidden token specified", std::move(query));
   }
   auto user_id = r_user_id.ok();
   if (user_id <= 0 || user_id >= (static_cast<td::int64>(1) << 54)) {
@@ -90,13 +90,12 @@ void ClientManager::send(PromisedQueryPtr query) {
 
   auto id_it = token_to_id_.find(token);
   if (id_it == token_to_id_.end()) {
-    td::string ip_address;
-    if (query->peer_address().is_valid() && !query->peer_address().is_reserved()) {  // external connection
-      ip_address = query->peer_address().get_ip_str().str();
-    } else {
-      // invalid peer address or connection from the local network
-      ip_address = query->get_header("x-real-ip").str();
+    auto method = query->method();
+    if (method == "close") {
+      return fail_query(400, "Bad Request: the bot has already been closed", std::move(query));
     }
+
+    td::string ip_address = query->get_peer_ip_address();
     if (!ip_address.empty()) {
       td::IPAddress tmp;
       tmp.init_host_port(ip_address, 0).ignore();
@@ -105,7 +104,7 @@ void ClientManager::send(PromisedQueryPtr query) {
         ip_address = tmp.get_ip_str().str();
       }
     }
-    LOG(DEBUG) << "Receive incoming query for new bot " << token << " from " << query->peer_address();
+    LOG(DEBUG) << "Receive incoming query for new bot " << token << " from " << ip_address;
     if (!ip_address.empty()) {
       LOG(DEBUG) << "Check Client creation flood control for IP address " << ip_address;
       auto res = flood_controls_.emplace(std::move(ip_address), td::FloodControlFast());
@@ -117,10 +116,19 @@ void ClientManager::send(PromisedQueryPtr query) {
       auto now = td::Time::now();
       auto wakeup_at = flood_control.get_wakeup_at();
       if (wakeup_at > now) {
-        LOG(INFO) << "Failed to create Client from IP address " << ip_address;
+        LOG(INFO) << "Failed to create Client from IP address " << ip_address << " with token";
         return query->set_retry_after_error(static_cast<int>(wakeup_at - now) + 1);
       }
       flood_control.add_event(now);
+    }
+    if (is_global_flood_control_enabled_) {
+      auto now = td::Time::now();
+      auto wakeup_at = global_flood_control_.get_wakeup_at();
+      if (wakeup_at > now) {
+        LOG(WARNING) << "Failed to create Client with token " << token;
+        return query->set_retry_after_error(static_cast<int>(wakeup_at - now) + 1);
+      }
+      global_flood_control_.add_event(now);
     }
     auto tqueue_id = get_tqueue_id(user_id, query->is_test_dc());
     if (active_client_count_.count(tqueue_id) != 0) {
@@ -134,7 +142,6 @@ void ClientManager::send(PromisedQueryPtr query) {
                                                     query->token().str(), query->is_test_dc(), tqueue_id, parameters_,
                                                     client_info->stat_.actor_id(&client_info->stat_));
 
-    auto method = query->method();
     if (method != "deletewebhook" && method != "setwebhook") {
       auto bot_token_with_dc = PSTRING() << query->token() << (query->is_test_dc() ? ":T" : "");
       auto webhook_info = parameters_->shared_data_->webhook_db_->get(bot_token_with_dc);
@@ -148,6 +155,39 @@ void ClientManager::send(PromisedQueryPtr query) {
   }
   send_closure(clients_.get(id_it->second)->client_, &Client::send,
                std::move(query));  // will send 429 if the client is already closed
+}
+
+ClientManager::TopClients ClientManager::get_top_clients(std::size_t max_count, td::Slice token_filter) {
+  auto now = td::Time::now();
+  TopClients result;
+  td::vector<std::pair<td::int64, td::uint64>> top_client_ids;
+  for (auto id : clients_.ids()) {
+    auto *client_info = clients_.get(id);
+    CHECK(client_info);
+
+    if (client_info->stat_.is_active(now)) {
+      result.active_count++;
+    }
+
+    if (!td::begins_with(client_info->token_, token_filter)) {
+      continue;
+    }
+
+    auto score = static_cast<td::int64>(client_info->stat_.get_score(now) * -1e9);
+    if (score == 0 && top_client_ids.size() >= max_count) {
+      continue;
+    }
+    top_client_ids.emplace_back(score, id);
+  }
+  if (top_client_ids.size() < max_count) {
+    max_count = top_client_ids.size();
+  }
+  std::partial_sort(top_client_ids.begin(), top_client_ids.begin() + max_count, top_client_ids.end());
+  result.top_client_ids.reserve(max_count);
+  for (std::size_t i = 0; i < max_count; i++) {
+    result.top_client_ids.push_back(top_client_ids[i].second);
+  }
+  return result;
 }
 
 void ClientManager::get_stats(td::Promise<td::BufferSlice> promise,
@@ -186,38 +226,12 @@ void ClientManager::get_stats(td::Promise<td::BufferSlice> promise,
   }
 
   auto now = td::Time::now();
-  td::int32 active_bot_count = 0;
-  td::vector<std::pair<td::int64, td::uint64>> top_bot_ids;
-  size_t max_bots = 50;
-  for (auto id : clients_.ids()) {
-    auto *client_info = clients_.get(id);
-    CHECK(client_info);
-
-    if (client_info->stat_.is_active(now)) {
-      active_bot_count++;
-    }
-
-    if (!td::begins_with(client_info->token_, id_filter)) {
-      continue;
-    }
-
-    auto score = static_cast<td::int64>(client_info->stat_.get_score(now) * -1e9);
-    if (score == 0 && top_bot_ids.size() >= max_bots) {
-      continue;
-    }
-    top_bot_ids.emplace_back(score, id);
-  }
-  if (top_bot_ids.size() < max_bots) {
-    max_bots = top_bot_ids.size();
-  }
-  std::partial_sort(top_bot_ids.begin(), top_bot_ids.begin() + max_bots, top_bot_ids.end());
-  top_bot_ids.resize(max_bots);
-
-  sb << stat_.get_description() << '\n';
+  auto top_clients = get_top_clients(50, id_filter);
+  sb << BotStatActor::get_description() << '\n';
   if (id_filter.empty()) {
     sb << "uptime\t" << now - parameters_->start_time_ << '\n';
     sb << "bot_count\t" << clients_.size() << '\n';
-    sb << "active_bot_count\t" << active_bot_count << '\n';
+    sb << "active_bot_count\t" << top_clients.active_count << '\n';
     auto r_mem_stat = td::mem_stat();
     if (r_mem_stat.is_ok()) {
       auto mem_stat = r_mem_stat.move_as_ok();
@@ -229,7 +243,6 @@ void ClientManager::get_stats(td::Promise<td::BufferSlice> promise,
       LOG(INFO) << "Failed to get memory statistics: " << r_mem_stat.error();
     }
 
-    ServerCpuStat::update(td::Time::now());
     auto cpu_stats = ServerCpuStat::instance().as_vector(td::Time::now());
     for (auto &stat : cpu_stats) {
       sb << stat.key_ << "\t" << stat.value_ << '\n';
@@ -245,8 +258,8 @@ void ClientManager::get_stats(td::Promise<td::BufferSlice> promise,
     }
   }
 
-  for (auto top_bot_id : top_bot_ids) {
-    auto *client_info = clients_.get(top_bot_id.second);
+  for (auto top_client_id : top_clients.top_client_ids) {
+    auto *client_info = clients_.get(top_client_id);
     CHECK(client_info);
 
     auto bot_info = client_info->client_.get_actor_unsafe()->get_bot_info();
@@ -302,9 +315,6 @@ td::int64 ClientManager::get_tqueue_id(td::int64 user_id, bool is_test_dc) {
 }
 
 void ClientManager::start_up() {
-  //NB: the same scheduler as for database in Td
-  auto scheduler_id = 1;
-
   // init tqueue
   {
     auto load_start_time = td::Time::now();
@@ -332,7 +342,8 @@ void ClientManager::start_up() {
       }
     }
 
-    auto concurrent_binlog = std::make_shared<td::ConcurrentBinlog>(std::move(binlog), scheduler_id);
+    auto concurrent_binlog =
+        std::make_shared<td::ConcurrentBinlog>(std::move(binlog), SharedData::get_binlog_scheduler_id());
     auto concurrent_tqueue_binlog = td::make_unique<td::TQueueBinlog<td::BinlogInterface>>();
     concurrent_tqueue_binlog->set_binlog(std::move(concurrent_binlog));
     tqueue->set_callback(std::move(concurrent_tqueue_binlog));
@@ -347,12 +358,12 @@ void ClientManager::start_up() {
   // init webhook_db
   auto concurrent_webhook_db = td::make_unique<td::BinlogKeyValue<td::ConcurrentBinlog>>();
   auto status = concurrent_webhook_db->init(parameters_->working_directory_ + "webhooks_db.binlog", td::DbKey::empty(),
-                                            scheduler_id);
+                                            SharedData::get_binlog_scheduler_id());
   LOG_IF(FATAL, status.is_error()) << "Can't open webhooks_db.binlog " << status;
   parameters_->shared_data_->webhook_db_ = std::move(concurrent_webhook_db);
 
   auto &webhook_db = *parameters_->shared_data_->webhook_db_;
-  for (auto key_value : webhook_db.get_all()) {
+  for (const auto &key_value : webhook_db.get_all()) {
     if (!token_range_(td::to_integer<td::uint64>(key_value.first))) {
       LOG(WARNING) << "DROP WEBHOOK: " << key_value.first << " ---> " << key_value.second;
       webhook_db.erase(key_value.first);
@@ -364,8 +375,8 @@ void ClientManager::start_up() {
   }
 
   // launch watchdog
-  watchdog_id_ = td::create_actor_on_scheduler<Watchdog>(
-      "ManagerWatchdog", td::Scheduler::instance()->sched_count() - 3, td::this_thread::get_id(), WATCHDOG_TIMEOUT);
+  watchdog_id_ = td::create_actor_on_scheduler<Watchdog>("ManagerWatchdog", SharedData::get_watchdog_scheduler_id(),
+                                                         td::this_thread::get_id(), WATCHDOG_TIMEOUT);
   set_timeout_in(600.0);
 }
 
@@ -375,7 +386,7 @@ PromisedQueryPtr ClientManager::get_webhook_restore_query(td::Slice token, td::S
   td::vector<td::BufferSlice> containers;
   auto add_string = [&containers](td::Slice str) {
     containers.emplace_back(str);
-    return containers.back().as_slice();
+    return containers.back().as_mutable_slice();
   };
 
   token = add_string(token);
@@ -481,6 +492,37 @@ void ClientManager::dump_statistics() {
   }
 
   td::dump_pending_network_queries(*parameters_->net_query_stats_);
+
+  auto now = td::Time::now();
+  auto top_clients = get_top_clients(10, {});
+  for (auto top_client_id : top_clients.top_client_ids) {
+    auto *client_info = clients_.get(top_client_id);
+    CHECK(client_info);
+
+    auto bot_info = client_info->client_.get_actor_unsafe()->get_bot_info();
+    td::string update_count;
+    td::string request_count;
+    auto replace_tabs = [](td::string &str) {
+      for (auto &c : str) {
+        if (c == '\t') {
+          c = ' ';
+        }
+      }
+    };
+    auto stats = client_info->stat_.as_vector(now);
+    for (auto &stat : stats) {
+      if (stat.key_ == "update_count") {
+        replace_tabs(stat.value_);
+        update_count = std::move(stat.value_);
+      }
+      if (stat.key_ == "request_count") {
+        replace_tabs(stat.value_);
+        request_count = std::move(stat.value_);
+      }
+    }
+    LOG(WARNING) << td::tag("id", bot_info.id_) << td::tag("update_count", update_count)
+                 << td::tag("request_count", request_count);
+  }
 }
 
 void ClientManager::raw_event(const td::Event::Raw &event) {
@@ -501,7 +543,7 @@ void ClientManager::raw_event(const td::Event::Raw &event) {
 
 void ClientManager::timeout_expired() {
   send_closure(watchdog_id_, &Watchdog::kick);
-  set_timeout_in(WATCHDOG_TIMEOUT / 2);
+  set_timeout_in(WATCHDOG_TIMEOUT / 10);
 
   double now = td::Time::now();
   if (now > next_tqueue_gc_time_) {
@@ -518,6 +560,12 @@ void ClientManager::timeout_expired() {
       LOG(WARNING) << "TQueue GC already deleted " << tqueue_deleted_events_ << " events since the start";
       last_tqueue_deleted_events_ = tqueue_deleted_events_;
     }
+  }
+
+  if (!is_global_flood_control_enabled_ && !parameters_->local_mode_) {
+    is_global_flood_control_enabled_ = true;
+    global_flood_control_.add_limit(60, 1000);        // 1000 in a minute
+    global_flood_control_.add_limit(60 * 60, 10000);  // 10000 in an hour
   }
 }
 
@@ -556,7 +604,5 @@ void ClientManager::finish_close() {
   }
   stop();
 }
-
-constexpr double ClientManager::WATCHDOG_TIMEOUT;
 
 }  // namespace telegram_bot_api
